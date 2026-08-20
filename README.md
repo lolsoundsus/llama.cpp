@@ -1,5 +1,5 @@
 # Unsloth's llama.cpp + Anbeeld's beellama.cpp
-Fully edited by Big Pickle in OpenCode
+Fully edited by Big Pickle in OpenCode.
 LLM inference in C/C++ with Variance-Normalized KV-Cache Quantization.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
