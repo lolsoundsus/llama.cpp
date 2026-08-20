@@ -90,9 +90,6 @@ class ConversationsStore {
 	/** In-flight init run; shared by concurrent callers, reset on failure to allow retry */
 	private initPromise: Promise<void> | null = null;
 
-	/** In-flight init run; shared by concurrent callers, reset on failure to allow retry */
-	private initPromise: Promise<void> | null = null;
-
 	/**
 	 *
 	 *

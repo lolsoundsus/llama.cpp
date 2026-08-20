@@ -176,10 +176,6 @@ class ToolsStore {
 		return this._serverHome ?? null;
 	}
 
-	get serverHome(): string | null {
-		return this._serverHome ?? null;
-	}
-
 	get mcpTools(): OpenAIToolDefinition[] {
 		return this.mcpEntries().map((e) => e.definition);
 	}
