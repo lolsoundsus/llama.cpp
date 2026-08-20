@@ -1,5 +1,4 @@
 <script lang="ts">
-	import { ICON_CLASS_DEFAULT } from '$lib/constants/css-classes';
 	import { ChevronDown, ChevronRight } from '@lucide/svelte';
 	import { McpServerIdentity, TruncatedText } from '$lib/components/app';
 	import { Checkbox } from '$lib/components/ui/checkbox';

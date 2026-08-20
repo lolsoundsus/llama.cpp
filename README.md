@@ -102,7 +102,7 @@ cmake --build build --config Release -j$(nproc)
 
 ### With KVarN Support
 
-KVarN is enabled by default. Use `--cache-type-k` and `--cache-type-v` at runtime to activate.
+KVarN is available but disabled by default. Default cache is full precision (f16). Use `--cache-type-k` and `--cache-type-v` at runtime to enable KVarN quantized caching.
 
 ## Tested Hardware
 
