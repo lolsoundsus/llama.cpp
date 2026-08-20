@@ -104,6 +104,14 @@ cmake --build build --config Release -j$(nproc)
 
 KVarN is enabled by default. Use `--cache-type-k` and `--cache-type-v` at runtime to activate.
 
+## Tested Hardware
+
+Currently tested on **Linux x86_64 with CUDA**:
+- AMD Ryzen 7 7745HX
+- 2x NVIDIA RTX 4060 Ti 16GB
+
+Other platforms (Windows, macOS, AMD HIP, Vulkan) are not yet tested. YMMV.
+
 ## Documentation
 
 - [Build guide](docs/build.md)
