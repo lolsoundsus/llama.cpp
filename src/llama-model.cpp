@@ -9,7 +9,9 @@
 #include "llama-model-loader.h"
 
 #include "llama-kv-cache.h"
+#include "llama-kv-cache-placement.h"
 #include "llama-kv-cache-iswa.h"
+#include "llama-kv-cache-kvarn.h"
 #include "llama-kv-cache-dsa.h"
 #include "llama-kv-cache-msa.h"
 #include "llama-kv-cache-dsv4.h"
@@ -362,6 +364,8 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     const llama_meta_device_get_split_state_userdata * ud = (const llama_meta_device_get_split_state_userdata *) userdata;
     const llama_hparams & hparams = ud->model->hparams;
     const std::string tensor_name = tensor->name;
+    const llama_kv_cache_component cache_component =
+            llama_kv_cache_component_from_name(tensor_name);
 
     static const std::regex pattern_q_weight        ("blk\\.\\d*\\.attn_q.weight");
     static const std::regex pattern_kv_weight       ("blk\\.\\d*\\.attn_(k|v).weight");
@@ -370,7 +374,6 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_kv_bias         ("blk\\.\\d*\\.attn_(k|v)\\.bias");
     static const std::regex pattern_qkv_bias        ("blk\\.\\d*\\.attn_qkv.bias");
     static const std::regex pattern_qk_norm         ("blk\\.\\d*\\.attn_(q|k)_norm\\.weight");
-    static const std::regex pattern_kv_cache        ("cache_(k|v)_l\\d*");
     static const std::regex pattern_attn_sinks      ("blk\\.\\d*\\.attn_sinks.weight");
     static const std::regex pattern_attn_out_weight ("blk\\.\\d*\\.attn_output.weight");
     static const std::regex pattern_attn_out_bias   ("blk\\.\\d*\\.attn_output.bias");
@@ -450,6 +453,11 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     };
 
     auto get_tensor_config = [&]() -> tensor_config {
+        if (cache_component.valid) {
+            return get_tensor_config_impl(
+                    ggml_backend_meta_split_axis(cache_component.split_axis),
+                    "attn_output.weight");
+        }
         // standard attention
         if (std::regex_match(tensor_name, pattern_q_weight) || std::regex_match(tensor_name, pattern_kv_weight)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight", "ssm_out.weight");
@@ -466,7 +474,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         if (std::regex_match(tensor_name, pattern_qk_norm)) {
             return get_tensor_config_impl(tensor->ne[1] == 1 ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight");
         }
-        if (std::regex_match(tensor_name, pattern_kv_cache) || std::regex_match(tensor_name, pattern_attn_sinks)) {
+        if (std::regex_match(tensor_name, pattern_attn_sinks)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "attn_output.weight");
         }
         if (std::regex_match(tensor_name, pattern_attn_out_weight)) {
@@ -655,9 +663,30 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             }
 
             const int64_t granularity_kv = granularity_q / n_gqa;
+            if (cache_component.valid) {
+                GGML_ASSERT(segments.size() == 1);
+                switch (cache_component.role) {
+                    case LLAMA_KV_CACHE_COMPONENT_STANDARD_K:
+                    case LLAMA_KV_CACHE_COMPONENT_STANDARD_K_TAIL:
+                    case LLAMA_KV_CACHE_COMPONENT_KVARN_K_TAIL:
+                        return { int64_t(hparams.n_embd_head_k(il)) };
+                    case LLAMA_KV_CACHE_COMPONENT_STANDARD_V:
+                    case LLAMA_KV_CACHE_COMPONENT_STANDARD_V_TAIL:
+                    case LLAMA_KV_CACHE_COMPONENT_KVARN_V_TAIL:
+                        return { int64_t(hparams.n_embd_head_v(il)) };
+                    case LLAMA_KV_CACHE_COMPONENT_KVARN_K_RECORDS:
+                    case LLAMA_KV_CACHE_COMPONENT_KVARN_K_STAGE:
+                        return { int64_t(llama_kvarn_head_slices(hparams.n_embd_head_k(il))) };
+                    case LLAMA_KV_CACHE_COMPONENT_KVARN_V_RECORDS:
+                    case LLAMA_KV_CACHE_COMPONENT_KVARN_V_STAGE:
+                        return { int64_t(llama_kvarn_head_slices(hparams.n_embd_head_v(il))) };
+                    case LLAMA_KV_CACHE_COMPONENT_UNKNOWN:
+                        break;
+                }
+                GGML_ABORT("unknown typed KV cache component");
+            }
             if (std::regex_match(tensor_name, pattern_kv_weight) ||
-                std::regex_match(tensor_name, pattern_kv_bias) ||
-                std::regex_match(tensor_name, pattern_kv_cache)) {
+                std::regex_match(tensor_name, pattern_kv_bias)) {
                 GGML_ASSERT(segments.size() == 1);
                 return {granularity_kv};
             }
@@ -688,13 +717,11 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     if (split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS) {
         const int64_t blck_size = ggml_blck_size(tc.tensor_axis_0->type);
         const float * tensor_split = ud->model->tensor_split();
-        std::vector<float> tensor_split_scan;
-        tensor_split_scan.reserve(ud->n_devices);
+        std::vector<float> tensor_split_weights;
+        tensor_split_weights.reserve(ud->n_devices);
         for (size_t j = 0; j < ud->n_devices; j++) {
-            tensor_split_scan.push_back(tensor_split == nullptr ? 0.0f : tensor_split[(j + tc.rotation) % ud->n_devices]);
-            if (j > 0) {
-                tensor_split_scan[j] += tensor_split_scan[j - 1];
-            }
+            tensor_split_weights.push_back(
+                    tensor_split == nullptr ? 0.0f : tensor_split[(j + tc.rotation) % ud->n_devices]);
         }
         const std::vector<std::pair<int64_t, uint32_t>> segments = get_split_segments(split_state.axis, tc.il);
         const std::vector<int64_t> granularity = get_split_granularity(blck_size, tc.il, segments);
@@ -702,18 +729,10 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             const int64_t  ne_s = segments[is].first;
             const uint32_t nr_s = segments[is].second;
             const int64_t  g_s  = granularity[is];
-            int64_t low = 0;
-            size_t j = 0;
-            for (; j < ud->n_devices - 1; j++) {
-                int64_t high = tensor_split_scan.back() == 0.0f ?
-                    ne_s * (j+1)/ud->n_devices : ne_s * tensor_split_scan[j]/tensor_split_scan.back();
-                if (high % g_s != 0) {
-                    high -= high % g_s;
-                }
-                split_state.ne[is*ud->n_devices + (j + tc.rotation) % ud->n_devices] = high - low;
-                low = high;
+            const auto counts = llama_tensor_split_counts(ne_s, tensor_split_weights, g_s);
+            for (size_t j = 0; j < ud->n_devices; ++j) {
+                split_state.ne[is*ud->n_devices + (j + tc.rotation) % ud->n_devices] = counts[j];
             }
-            split_state.ne[is*ud->n_devices + (j + tc.rotation) % ud->n_devices] = ne_s - low;
             split_state.nr[is] = nr_s;
         }
         split_state.n_segments = segments.size();
@@ -1067,6 +1086,7 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
         // llama_model_params stores tensor_split as a borrowed pointer, but the model
         // may need it later for tensor-parallel KV-cache split metadata.
         pimpl->tensor_split_owned.assign(params.tensor_split, params.tensor_split + llama_max_devices());
+        (void) llama_tensor_split_counts(0, pimpl->tensor_split_owned, 1);
         this->params.tensor_split = pimpl->tensor_split_owned.data();
     }
     pimpl->has_tensor_overrides = params.tensor_buft_overrides && params.tensor_buft_overrides[0].pattern;
@@ -1754,6 +1774,20 @@ llama_split_mode llama_model::split_mode() const {
     return params.split_mode;
 }
 
+bool llama_model::graph_consumes_exact_kv_tail() const {
+    return !hparams.is_mla();
+}
+
+bool llama_model::self_attention_uses_explicit_bias(uint32_t il) const {
+    if (il >= layers.size()) {
+        return false;
+    }
+    const auto & layer = layers[il];
+    const auto & fallback = layers.front();
+    return layer.attn_rel_b != nullptr || fallback.attn_rel_b != nullptr ||
+           layer.attn_rel_b_enc != nullptr || fallback.attn_rel_b_enc != nullptr;
+}
+
 std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> ret;
     for (const auto & [ctx, bufs] : pimpl->ctxs_bufs) {
@@ -2093,6 +2127,8 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
 
 llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams) const {
     llama_memory_i * res;
+    const ggml_type kvarn_tail_type = params.kv_tail_type == GGML_TYPE_COUNT ?
+            GGML_TYPE_F16 : params.kv_tail_type;
 
     switch (arch) {
         // Models that need specific instantiation should be handled in the
@@ -2134,7 +2170,12 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         hparams.swa_type,
                         nullptr,
                         filter_idx,
-                        nullptr);
+                        nullptr,
+                        cparams.n_ubatch,
+                        params.kv_tail_tokens,
+                        params.kv_tail_type,
+                        params.kv_tail_tokens_requested,
+                        params.kv_tail_rollback_tokens);
             } break;
         case LLM_ARCH_GLM_DSA:
         case LLM_ARCH_DEEPSEEK32:
@@ -2186,7 +2227,12 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             hparams.swa_type,
                             filter_mla,
                             filter_lid,
-                            nullptr);
+                            nullptr,
+                            cparams.n_ubatch,
+                            params.kv_tail_tokens,
+                            params.kv_tail_type,
+                            params.kv_tail_tokens_requested,
+                            params.kv_tail_rollback_tokens);
                 }
             } break;
         case LLM_ARCH_DEEPSEEK4:
@@ -2208,6 +2254,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             cparams.kv_unified,
                             cparams.n_ctx_seq,
                             cparams.n_seq_max,
+                            cparams.n_batch,
                             cparams.n_ubatch,
                             1,
                             nullptr,
@@ -2229,7 +2276,11 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             1,
                             cparams.n_rs_seq,
                             nullptr,
-                            nullptr);
+                            nullptr,
+                            params.kv_tail_tokens_swa,
+                            params.kv_tail_type,
+                            params.kv_tail_tokens_swa_requested,
+                            params.kv_tail_rollback_tokens);
                 }
             } break;
         case LLM_ARCH_DFLASH:
@@ -2248,6 +2299,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             cparams.kv_unified,
                             cparams.n_ctx_seq,
                             cparams.n_seq_max,
+                            cparams.n_batch,
                             cparams.n_ubatch,
                             1,
                             nullptr,
@@ -2314,6 +2366,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* attn_v_trans      */ !cparams.flash_attn,
                             /* attn_swa_full     */ params.swa_full,
                             /* attn_kv_size      */ cparams.n_ctx_seq,
+                            /* attn_n_batch      */ cparams.n_batch,
                             /* attn_n_ubatch     */ cparams.n_ubatch,
                             /* attn_n_pad        */ 1,
                             /* recurrent_type_r  */ GGML_TYPE_F32,
@@ -2324,26 +2377,71 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* offload           */ cparams.offload_kqv,
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
-                            /* filter_recr       */ std::move(filter_recr));
+                            /* filter_recr       */ std::move(filter_recr),
+                            /* kvarn             */ params.kvarn,
+                            /* tail_tokens       */ params.kv_tail_tokens,
+                            /* tail_tokens_swa   */ params.kv_tail_tokens_swa,
+                            /* tail_type         */ params.kv_tail_type,
+                            /* tail requested    */ params.kv_tail_tokens_requested,
+                            /* SWA requested     */ params.kv_tail_tokens_swa_requested,
+                            /* rollback reserve  */ params.kv_tail_rollback_tokens,
+                            /* SWA native exact  */ params.kv_tail_native_exact_swa);
                     } else {
-                        res = new llama_memory_hybrid(
-                            /* model             */ *this,
-                            /* attn_type_k       */ params.type_k,
-                            /* attn_type_v       */ params.type_v,
-                            /* attn_v_trans      */ !cparams.flash_attn,
-                            /* attn_kv_size      */ cparams.n_ctx_seq,
-                            /* attn_n_pad        */ 1,
-                            /* attn_n_swa        */ hparams.n_swa,
-                            /* attn_swa_type     */ hparams.swa_type,
-                            /* recurrent_type_k  */ GGML_TYPE_F32,
-                            /* recurrent_type_v  */ GGML_TYPE_F32,
-                            /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
-                            /* n_seq_max         */ cparams.n_seq_max,
-                            /* n_rs_seq          */ cparams.n_rs_seq,
-                            /* offload           */ cparams.offload_kqv,
-                            /* unified           */ cparams.kv_unified,
-                            /* filter_attn       */ std::move(filter_attn),
-                            /* filter_recr       */ std::move(filter_recr));
+                        if (params.kvarn.type != LLAMA_KVARN_TYPE_DISABLED) {
+                            std::unique_ptr<llama_memory_i> mem_attn;
+                            if (params.kv_tail_native_exact) {
+                                mem_attn = std::make_unique<llama_kv_cache>(
+                                        *this, hparams, kvarn_tail_type, kvarn_tail_type,
+                                        !cparams.flash_attn, cparams.offload_kqv, cparams.kv_unified,
+                                        cparams.n_ctx_seq, cparams.n_seq_max, 1,
+                                        hparams.n_swa, hparams.swa_type, nullptr, filter_attn,
+                                        nullptr, nullptr, cparams.n_ubatch, 0,
+                                        kvarn_tail_type, 0, false, params.kv_tail_rollback_tokens,
+                                        params.kv_tail_native_exact ? cparams.n_ctx : 0);
+                            } else {
+                                mem_attn = std::make_unique<llama_kv_cache_kvarn>(
+                                        *this, hparams, params.kvarn, cparams.offload_kqv,
+                                        cparams.kv_unified, cparams.n_ctx_seq, cparams.n_seq_max,
+                                        cparams.n_batch, cparams.n_ubatch, 1, hparams.n_swa,
+                                        hparams.swa_type, filter_attn, nullptr, params.kv_tail_tokens,
+                                        kvarn_tail_type, params.kv_tail_tokens_requested,
+                                        params.kv_tail_rollback_tokens);
+                            }
+                            auto mem_recr = std::make_unique<llama_memory_recurrent>(
+                                    *this,
+                                    GGML_TYPE_F32,
+                                    GGML_TYPE_F32,
+                                    cparams.offload_kqv,
+                                    std::max((uint32_t) 1, cparams.n_seq_max),
+                                    cparams.n_seq_max,
+                                    cparams.n_rs_seq,
+                                    filter_recr);
+                            res = new llama_memory_hybrid(*this, std::move(mem_attn), std::move(mem_recr));
+                        } else {
+                            res = new llama_memory_hybrid(
+                                /* model             */ *this,
+                                /* attn_type_k       */ params.type_k,
+                                /* attn_type_v       */ params.type_v,
+                                /* attn_v_trans      */ !cparams.flash_attn,
+                                /* attn_kv_size      */ cparams.n_ctx_seq,
+                                /* attn_n_pad        */ 1,
+                                /* attn_n_swa        */ hparams.n_swa,
+                                /* attn_swa_type     */ hparams.swa_type,
+                                /* recurrent_type_k  */ GGML_TYPE_F32,
+                                /* recurrent_type_v  */ GGML_TYPE_F32,
+                                /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
+                                /* n_seq_max         */ cparams.n_seq_max,
+                                /* n_rs_seq          */ cparams.n_rs_seq,
+                                /* offload           */ cparams.offload_kqv,
+                                /* unified           */ cparams.kv_unified,
+                                /* filter_attn       */ std::move(filter_attn),
+                                /* filter_recr       */ std::move(filter_recr),
+                                /* n_ubatch          */ cparams.n_ubatch,
+                                /* tail_tokens       */ params.kv_tail_tokens,
+                                /* tail_type         */ params.kv_tail_type,
+                                /* tail requested    */ params.kv_tail_tokens_requested,
+                                /* rollback reserve  */ params.kv_tail_rollback_tokens);
+                        }
                     }
                 } else {
                     llama_kv_cache::layer_filter_cb filter = nullptr;
@@ -2402,12 +2500,21 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     cparams.kv_unified,
                                     cparams.n_ctx_seq,
                                     cparams.n_seq_max,
+                                    cparams.n_batch,
                                     cparams.n_ubatch,
                                     1,
                                     mem_other,
                                     filter,
                                     reuse,
-                                    share);
+                                    share,
+                                    params.kvarn,
+                                    params.kv_tail_tokens,
+                                    params.kv_tail_tokens_swa,
+                                    params.kv_tail_type,
+                                    params.kv_tail_tokens_requested,
+                                    params.kv_tail_tokens_swa_requested,
+                                    params.kv_tail_rollback_tokens,
+                                    params.kv_tail_native_exact_swa);
                         } else {
                             res = new llama_kv_cache_iswa(
                                     *this,
@@ -2419,33 +2526,69 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     cparams.kv_unified,
                                     cparams.n_ctx_seq,
                                     cparams.n_seq_max,
+                                    cparams.n_batch,
                                     cparams.n_ubatch,
                                     1,
                                     nullptr,
                                     filter,
                                     reuse,
-                                    share);
+                                    share,
+                                    params.kvarn,
+                                    params.kv_tail_tokens,
+                                    params.kv_tail_tokens_swa,
+                                    params.kv_tail_type,
+                                    params.kv_tail_tokens_requested,
+                                    params.kv_tail_tokens_swa_requested,
+                                    params.kv_tail_rollback_tokens,
+                                    params.kv_tail_native_exact_swa);
                         }
                     } else {
                         GGML_ASSERT(!hparams.is_swa_any());
 
-                        res = new llama_kv_cache(
-                                *this,
-                                hparams,
-                                params.type_k,
-                                params.type_v,
-                                !cparams.flash_attn,
-                                cparams.offload_kqv,
-                                cparams.kv_unified,
-                                cparams.n_ctx_seq,
-                                cparams.n_seq_max,
-                                1,
-                                hparams.n_swa,
-                                hparams.swa_type,
-                                nullptr,
-                                filter,
-                                nullptr,
-                                nullptr);
+                        if (params.kvarn.type != LLAMA_KVARN_TYPE_DISABLED) {
+                            if (params.kv_tail_native_exact) {
+                                res = new llama_kv_cache(
+                                        *this, hparams, kvarn_tail_type, kvarn_tail_type,
+                                        !cparams.flash_attn, cparams.offload_kqv, cparams.kv_unified,
+                                        cparams.n_ctx_seq, cparams.n_seq_max, 1,
+                                        hparams.n_swa, hparams.swa_type, nullptr, filter,
+                                        reuse, nullptr, cparams.n_ubatch, 0,
+                                        kvarn_tail_type, 0, false, params.kv_tail_rollback_tokens,
+                                        params.kv_tail_native_exact ? cparams.n_ctx : 0);
+                            } else {
+                                res = new llama_kv_cache_kvarn(
+                                        *this, hparams, params.kvarn, cparams.offload_kqv,
+                                        cparams.kv_unified, cparams.n_ctx_seq, cparams.n_seq_max,
+                                        cparams.n_batch, cparams.n_ubatch, 1, hparams.n_swa,
+                                        hparams.swa_type, filter, reuse, params.kv_tail_tokens,
+                                        kvarn_tail_type, params.kv_tail_tokens_requested,
+                                        params.kv_tail_rollback_tokens);
+                            }
+                        } else {
+                            res = new llama_kv_cache(
+                                    *this,
+                                    hparams,
+                                    params.type_k,
+                                    params.type_v,
+                                    !cparams.flash_attn,
+                                    cparams.offload_kqv,
+                                    cparams.kv_unified,
+                                    cparams.n_ctx_seq,
+                                    cparams.n_seq_max,
+                                    1,
+                                    hparams.n_swa,
+                                    hparams.swa_type,
+                                    nullptr,
+                                    filter,
+                                    nullptr,
+                                    nullptr,
+                                    cparams.n_ubatch,
+                                    params.kv_tail_tokens,
+                                    params.kv_tail_type,
+                                    params.kv_tail_tokens_requested,
+                                    false,
+                                    params.kv_tail_rollback_tokens);
+                        }
                     }
                 }
             }
