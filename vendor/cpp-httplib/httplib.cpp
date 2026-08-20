@@ -5269,39 +5269,6 @@ void apply_addr_map(const std::map<std::string, std::string> &addr_map,
   }
 }
 
-bool is_ip_address(const std::string &host) {
-  struct in_addr addr4;
-  struct in6_addr addr6;
-  return inet_pton(AF_INET, host.c_str(), &addr4) == 1 ||
-         inet_pton(AF_INET6, host.c_str(), &addr6) == 1;
-}
-
-// Resolve where a client should connect for `host`, honoring a user-supplied
-// hostname-to-address map. `host` itself is never rewritten, so it keeps
-// supplying the Host header and SNI; only the connection target changes.
-//
-// A mapped IP literal goes to `ip`, which keeps create_socket's AI_NUMERICHOST
-// path. Anything else goes to `connect_host`, which create_socket resolves as
-// a name, or uses as the socket path when the address family is AF_UNIX. An
-// absent or empty mapping leaves `host` as the connection target; without the
-// empty check the value would reach getaddrinfo as a null node and silently
-// resolve to loopback.
-void apply_addr_map(const std::map<std::string, std::string> &addr_map,
-                           const std::string &host, std::string &connect_host,
-                           std::string &ip) {
-  connect_host = host;
-  ip.clear();
-
-  auto it = addr_map.find(host);
-  if (it == addr_map.end() || it->second.empty()) { return; }
-
-  if (is_ip_address(it->second)) {
-    ip = it->second;
-  } else {
-    connect_host = it->second;
-  }
-}
-
 } // namespace detail
 
 /*
