@@ -63,6 +63,28 @@ a wide range of hardware - locally and in the cloud.
 - Vulkan and SYCL backend support
 - CPU+GPU hybrid inference to partially accelerate models larger than the total VRAM capacity
 
+### KVarN: Variance-Normalized KV-Cache Quantization
+
+This fork includes **KVarN** (Variance-normalized KV-cache quantization) from [Anbeeld/beellama.cpp](https://github.com/Anbeeld/beellama.cpp), providing higher precision at similar memory costs compared to standard KV-cache quantization.
+
+**Features:**
+- Independent K and V bit widths: `kvarn2`, `kvarn3`, `kvarn4`, `kvarn5`, `kvarn6`, and `kvarn8`
+- Set via `--cache-type-k` and `--cache-type-v` flags
+- Native CUDA FlashAttention with MMA support for KVarN
+- Vulkan KVarN compute shaders
+- Portable KVarN attention for pre-Turing CUDA and AMD GPUs
+- Rotated-domain attention for KVarN decode
+- Prompt cache and checkpoint support for KVarN
+
+**Usage:**
+```sh
+# Use kvarn4 for both K and V caches
+llama serve -hf ggml-org/Qwen3.5-0.8B-GGUF --cache-type-k kvarn4 --cache-type-v kvarn4
+
+# Different bit widths for K and V
+llama serve -hf ggml-org/Qwen3.5-0.8B-GGUF --cache-type-k kvarn8 --cache-type-v kvarn4
+```
+
 The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-org/ggml) library.
 
 ## Supported backends
@@ -119,6 +141,9 @@ The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-or
 
 ## Acknowledgements
 
+- [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) - The upstream llama.cpp project - MIT License
+- [unslothai/llama.cpp](https://github.com/unslothai/llama.cpp) - Unsloth's llama.cpp fork with optimizations - MIT License
+- [Anbeeld/beellama.cpp](https://github.com/Anbeeld/beellama.cpp) - KVarN (Variance-normalized KV-cache quantization) implementation - MIT License
 - [yhirose/cpp-httplib](https://github.com/yhirose/cpp-httplib) - Single-header HTTP server, used by `llama-server` - MIT license
 - [nothings/stb](https://github.com/nothings/stb) - Single-header image format decoder, used by multimodal subsystem - Public domain
 - [nlohmann/json](https://github.com/nlohmann/json) - Single-header JSON library, used by various tools/examples - MIT License
