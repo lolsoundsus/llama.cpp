@@ -1465,18 +1465,6 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     int64_t s12 = nb12 / src1_ts;
     int64_t s13 = nb13 / src1_ts;
 
-    const size_t src0_ts = ggml_type_size(src0->type);
-    GGML_ASSERT(nb00 == src0_ts);
-    int64_t s01 = nb01 / src0_ts;
-    int64_t s02 = nb02 / src0_ts;
-    int64_t s03 = nb03 / src0_ts;
-
-    const size_t src1_ts = ggml_type_size(src1->type);
-    GGML_ASSERT(nb10 == src1_ts);
-    int64_t s11 = nb11 / src1_ts;
-    int64_t s12 = nb12 / src1_ts;
-    int64_t s13 = nb13 / src1_ts;
-
     float * dst_ddf = (float *) dst->data;
 
     const cuda_t * src0_ptr = nullptr;
@@ -1937,7 +1925,7 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
         return false;
     }
 
-    if (ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
+    if (ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1, src1->ne[2], /*mul_mat_id=*/true)) {
         return false;
     }
 
