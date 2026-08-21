@@ -4238,6 +4238,10 @@ llama_context * llama_init_from_model(
         if (params.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT || model->arch == LLM_ARCH_DFLASH) {
             LLAMA_LOG_WARN("%s: KVarN is target-context-only; disabling it for this auxiliary context\n", __func__);
             params.kvarn = llama_kvarn_default_params();
+            params.type_k = GGML_TYPE_F16;
+            params.type_v = GGML_TYPE_F16;
+            params.kv_tail_tokens = 0;
+            params.kv_tail_type = GGML_TYPE_COUNT;
         } else {
             bool head_dims_supported = true;
             bool backend_ops_supported = true;
