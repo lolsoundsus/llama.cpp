@@ -298,7 +298,6 @@ static std::filesystem::path get_server_exec_path() {
 }
 
 static void unset_reserved_args(common_preset & preset, bool unset_model_args) {
-    preset.remove_sensitive_options();
     preset.unset_option("LLAMA_ARG_SSL_KEY_FILE");
     preset.unset_option("LLAMA_ARG_SSL_CERT_FILE");
     preset.unset_option("LLAMA_API_KEY");
@@ -357,31 +356,6 @@ static std::vector<std::string> get_environment() {
     return env;
 }
 
-static void set_environment_value(
-        std::vector<std::string> & environment,
-        const std::string & key,
-        const std::string & value) {
-    const std::string prefix = key + "=";
-    auto matches = [&](const std::string & entry) {
-        if (entry.size() < prefix.size()) {
-            return false;
-        }
-#ifdef _WIN32
-        return _strnicmp(entry.c_str(), prefix.c_str(), prefix.size()) == 0;
-#else
-        return entry.compare(0, prefix.size(), prefix) == 0;
-#endif
-    };
-
-    for (std::string & entry : environment) {
-        if (matches(entry)) {
-            entry = prefix + value;
-            return;
-        }
-    }
-    environment.push_back(prefix + value);
-}
-
 void server_model_meta::update_args(common_preset_context & ctx_preset, std::string bin_path) {
     // update params
     unset_reserved_args(preset, false);
@@ -436,13 +410,11 @@ server_models::server_models(
         char ** argv)
             : ctx_preset(LLAMA_EXAMPLE_SERVER),
               base_params(params),
-              hf_token(params.hf_token),
               base_env(get_environment()),
               base_preset(ctx_preset.load_from_args(argc, argv)),
               sched(std::make_unique<server_lru_sched>(*this)) {
     // clean up base preset
     unset_reserved_args(base_preset, true);
-    base_params.hf_token.clear();
     // set binary path
     try {
         bin_path = get_server_exec_path().string();
@@ -530,7 +502,6 @@ void server_models::notify_sse(const std::string & event, const std::string & mo
 }
 
 void server_models::load_models() {
-    std::lock_guard<std::mutex> reload_lk(reload_mutex);
     // Phase 1: load presets from all sources - pure I/O, no lock needed
     // 1. cached models
     common_presets cached_models = ctx_preset.load_from_cache();
@@ -672,6 +643,7 @@ void server_models::load_models() {
     // which locks the mutex, so joining while holding it would deadlock).
     std::unique_lock<std::mutex> lk(mutex);
 
+    need_reload = false;
     bool is_first_load = mapping.empty();
 
     if (is_first_load) {
@@ -928,7 +900,12 @@ bool server_models::has_model(const std::string & name) {
 }
 
 std::optional<server_model_meta> server_models::get_meta(const std::string & name) {
-    std::lock_guard<std::mutex> lk(mutex);
+    std::unique_lock<std::mutex> lk(mutex);
+    if (need_reload) {
+        lk.unlock();
+        load_models();
+        lk.lock();
+    }
 
     auto it = mapping.find(name);
     if (it != mapping.end()) {
@@ -943,7 +920,12 @@ std::optional<server_model_meta> server_models::get_meta(const std::string & nam
 }
 
 std::vector<server_model_meta> server_models::get_all_meta() {
-    std::lock_guard<std::mutex> lk(mutex);
+    std::unique_lock<std::mutex> lk(mutex);
+    if (need_reload) {
+        lk.unlock();
+        load_models();
+        lk.lock();
+    }
 
     std::vector<server_model_meta> result;
     result.reserve(mapping.size());
@@ -1044,9 +1026,6 @@ void server_models::load(const std::string & name, const load_options & opts) {
         std::vector<std::string> child_args = inst.meta.args; // copy
         std::vector<std::string> child_env  = base_env; // copy
         child_env.push_back("LLAMA_SERVER_ROUTER_PORT=" + std::to_string(base_params.port));
-        if (!hf_token.empty()) {
-            set_environment_value(child_env, "HF_TOKEN", hf_token);
-        }
 
         if (opts.mode == SERVER_CHILD_MODE_DOWNLOAD) {
             inst.meta.status = SERVER_MODEL_STATUS_DOWNLOADING;
@@ -1285,6 +1264,7 @@ void server_models::update_download_progress(const std::string & name, const com
             if (done) {
                 // mark the instance to be erased on next load_models() call
                 it->second.meta.status = SERVER_MODEL_STATUS_DOWNLOADED;
+                need_reload = true;
             } else {
                 json & info = it->second.meta.loaded_info;
                 if (!info.contains("progress")) {
@@ -1981,7 +1961,10 @@ void server_models_routes::init_routes() {
     };
 
     this->get_router_models = [this](const server_http_req & req) {
-        GGML_UNUSED(req);
+        bool reload = !req.get_param("reload", "").empty();
+        if (reload) {
+            models.load_models();
+        }
         auto res = std::make_unique<server_http_res>();
         json models_json = json::array();
         auto all_models = models.get_all_meta();
@@ -2053,13 +2036,6 @@ void server_models_routes::init_routes() {
         return res;
     };
 
-    this->post_router_models_reload = [this](const server_http_req &) {
-        auto res = std::make_unique<server_http_res>();
-        models.load_models();
-        res_ok(res, {{"success", true}});
-        return res;
-    };
-
     this->post_router_models_unload = [this](const server_http_req & req) {
         auto res = std::make_unique<server_http_res>();
         json body = json::parse(req.body);
@@ -2107,7 +2083,7 @@ void server_models_routes::init_routes() {
 
         common_params p;
         p.model.hf_repo  = name;
-        p.hf_token       = models.hf_token;
+        p.hf_token       = params.hf_token;
 
         // validate by fetching metadata
         bool ok = false;

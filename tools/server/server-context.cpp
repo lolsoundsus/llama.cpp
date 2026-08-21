@@ -688,94 +688,6 @@ struct server_slot {
         other.prompt = prompt.clone();
         other.init_sampler();
     }
-
-    // returns 0 on success
-    // caller need to update prompt.tokens after a successful call to keep track of the processing progress
-    int process_mtmd_chunk(size_t idx, size_t & n_tokens_out) {
-        GGML_ASSERT(mctx);
-        const auto & input_tokens = task->tokens;
-        const auto & chunk = input_tokens.find_chunk(idx);
-        int32_t res = 0;
-
-        auto try_decode = [&]() -> int32_t {
-            if (mbatch) {
-                float * embd = mtmd_batch_get_output_embd(mbatch.get(), chunk.get());
-                if (embd) {
-                    void * cb_data = spec;
-                    static auto cb = [](llama_batch batch, void * user_data) {
-                        common_speculative * spec = static_cast<common_speculative *>(user_data);
-                        if (!common_speculative_process(spec, batch)) {
-                            return 1;
-                        }
-                        return 0;
-                    };
-
-                    llama_pos new_n_past; // unused for now
-                    res = mtmd_helper_decode_image_chunk(
-                        mctx,
-                        ctx_tgt,
-                        chunk.get(),
-                        embd,
-                        prompt.tokens.pos_next(),
-                        id,
-                        llama_n_batch(ctx_tgt),
-                        &new_n_past,
-                        cb,
-                        cb_data
-                    );
-                    if (res != 0) {
-                        SLT_ERR(*this, "failed to decode mtmd chunk, idx = %zu, res = %d\n", idx, res);
-                        return -1;
-                    }
-                    n_tokens_out = mtmd_input_chunk_get_n_tokens(chunk.get());
-                    return 0; // success
-                }
-            }
-            return 1; // (non-error) need to create & encode batch
-        };
-
-        // if the batch is already exist, try searching & encode
-        res = try_decode();
-        if (res == 0) {
-            return 0;
-        }
-        if (res < 0) {
-            // fatal error
-            return res;
-        }
-
-        // otherwise, the batch is either uninitialized or is used up
-        // we need to create & encode a new batch
-        mbatch.reset(mtmd_batch_init(mctx));
-        res = mtmd_batch_add_chunk(mbatch.get(), chunk.get());
-        GGML_ASSERT(res == 0); // we should never have an empty batch
-
-        // try batching as much as possible
-        int n_added = 1;
-        size_t idx_cur = idx;
-        while (res == 0) {
-            auto [next_chunk, next_idx] = input_tokens.find_next_media_chunk(idx_cur);
-            if (next_chunk == nullptr) {
-                break;
-            }
-            res = mtmd_batch_add_chunk(mbatch.get(), next_chunk->get());
-            n_added += (res == 0 ? 1 : 0);
-            idx_cur = next_idx;
-            SLT_DBG(*this, "try adding media chunk idx = %zu to batch, res = %d\n", next_idx, res);
-            // if res != 0, batch is full or chunk is not compatible -> this loop breaks
-        }
-
-        // TODO @ngxson : move this log line to debug when it become more stable
-        SLT_TRC(*this, "encoding mtmd batch from idx = %zu, n_chunks = %d\n", idx, n_added);
-
-        res = mtmd_batch_encode(mbatch.get());
-        if (res != 0) {
-            SLT_ERR(*this, "failed to encode mtmd batch for chunk idx = %zu, res = %d\n", idx, res);
-            return -1;
-        }
-
-        return try_decode();
-    }
 };
 
 // returns 0 on success
@@ -1054,33 +966,6 @@ private:
         const auto output_limits = server_output_limits(params_base);
         params_base.n_outputs_max = output_limits.total;
         params_base.n_outputs_max_per_seq = output_limits.per_seq;
-
-        const bool has_mmproj = !params.mmproj.path.empty();
-        const bool has_draft = params.speculative.has_dft();
-        const bool spec_mtp = std::find(params_base.speculative.types.begin(),
-                                        params_base.speculative.types.end(),
-                                        COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
-        const bool has_spec = has_draft || spec_mtp;
-
-        if (callback_state) {
-            std::vector<std::string> stages = {"text_model"};
-            if (has_spec) {
-                stages.push_back("spec_model");
-            }
-            if (has_mmproj) {
-                stages.push_back("mmproj_model");
-            }
-            load_progress_text.stages   = stages;
-            load_progress_mmproj.stages = stages;
-            load_progress_spec.stages   = stages;
-
-            // trigger 0% progress
-            load_progress_callback(0.0f, &load_progress_text);
-        }
-
-
-        SRV_INF("loading model '%s'\n", params.model.get_name().c_str());
-        SRV_TRC("local path '%s'\n", params.model.path.c_str());
 
         const bool has_mmproj = !params.mmproj.path.empty();
         const bool has_draft = params.speculative.has_dft();
@@ -2559,11 +2444,6 @@ private:
                     res->n_tasks_deferred    = queue_tasks.queue_tasks_deferred_size();
                     res->metrics             = metrics;
 
-                    res->n_draft_tokens_total      = metrics.n_draft_tokens_total;
-                    res->n_draft_accepted_total    = metrics.n_draft_accepted_total;
-                    res->n_draft_verif_steps_total = metrics.n_draft_verif_steps_total;
-                    res->n_accepted_per_pos_total  = metrics.n_accepted_per_pos_total;
-
                     if (task.metrics_reset_bucket) {
                         metrics.reset_bucket();
                     }
@@ -2597,9 +2477,6 @@ private:
                     server_slot * slot = get_slot_by_id(id_slot);
                     if (slot == nullptr) {
                         send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
-                        break;
-                    }
-                    if (!check_slot_no_media(*slot, task.id)) {
                         break;
                     }
                     if (slot->is_processing()) {
@@ -2715,10 +2592,6 @@ private:
                     server_slot * slot = get_slot_by_id(id_slot);
                     if (slot == nullptr) {
                         send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
-                        break;
-                    }
-                    // Gate on slot content, consistent with save/restore.
-                    if (!check_slot_no_media(*slot, task.id)) {
                         break;
                     }
                     if (slot->is_processing()) {
