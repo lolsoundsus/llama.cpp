@@ -130,9 +130,6 @@ int main(int argc, char ** argv) {
         LOG_ERR("set_input failed\n");
         return 1;
     }
-    fwrite(data, 1, data_len, f);
-    fclose(f);
-    LOG_INF("wrote %s\n", params.out_file.c_str());
 
     const int64_t t_prompt_start_us = ggml_time_us();
 
