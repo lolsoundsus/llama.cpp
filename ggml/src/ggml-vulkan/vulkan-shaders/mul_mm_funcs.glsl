@@ -581,7 +581,6 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
                                                     kvalues_mxfp4[vui2 >>  4] * d));
 #endif
 #endif
-#endif
 }
 
 #if !defined(MUL_MAT_ID)
