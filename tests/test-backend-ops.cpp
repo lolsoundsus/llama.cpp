@@ -19,10 +19,12 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpp.h"
+#include "arg.h"
 
 #include <algorithm>
 #include <atomic>
 #include <array>
+#include <cerrno>
 #include <cfloat>
 #include <cinttypes>
 #include <cstdarg>
@@ -51,6 +53,51 @@
 #   define N_THREADS std::thread::hardware_concurrency()
 #endif
 
+static uint64_t g_test_seed = UINT64_C(0x6a09e667f3bcc909);
+static thread_local uint64_t g_test_case_seed = g_test_seed;
+static thread_local uint64_t g_test_stream_index = 0;
+
+static uint64_t mix_test_seed(uint64_t value) {
+    value += UINT64_C(0x9e3779b97f4a7c15);
+    value = (value ^ (value >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
+    value = (value ^ (value >> 27)) * UINT64_C(0x94d049bb133111eb);
+    return value ^ (value >> 31);
+}
+
+static uint64_t hash_test_case_identity(const std::string & identity) {
+    uint64_t hash = UINT64_C(14695981039346656037);
+    for (const unsigned char byte : identity) {
+        hash ^= byte;
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+static void set_test_case_seed(uint64_t run_seed, const std::string & case_identity) {
+    g_test_case_seed = mix_test_seed(run_seed ^ hash_test_case_identity(case_identity));
+    g_test_stream_index = 0;
+}
+
+static uint64_t next_test_stream_seed() {
+    return mix_test_seed(g_test_case_seed ^ mix_test_seed(g_test_stream_index++));
+}
+
+static std::mt19937 make_test_rng_from_seed(uint64_t seed) {
+    std::seed_seq sequence {
+        static_cast<uint32_t>(seed),
+        static_cast<uint32_t>(seed >> 32),
+    };
+    return std::mt19937(sequence);
+}
+
+static std::mt19937 make_test_rng() {
+    return make_test_rng_from_seed(next_test_stream_seed());
+}
+
+static uint32_t test_random_u32() {
+    return static_cast<uint32_t>(next_test_stream_seed());
+}
+
 static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f) {
     size_t nels = ggml_nelements(tensor);
     std::vector<float> data(nels);
@@ -58,8 +105,9 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
         // parallel initialization
         static const size_t n_threads = N_THREADS;
 
+        const uint64_t tensor_seed = next_test_stream_seed();
         auto init_thread = [&](size_t start, size_t end) {
-            thread_local std::default_random_engine gen(std::random_device{}());
+            auto gen = make_test_rng_from_seed(mix_test_seed(tensor_seed ^ mix_test_seed(start) ^ mix_test_seed(end)));
             std::uniform_real_distribution<float> distribution(min, max);
             for (size_t i = start; i < end; i++) {
                 data[i] = distribution(gen);
@@ -152,8 +200,7 @@ static void init_tensor_kq_mask(ggml_tensor * tensor, float min = -1.0f, float m
     std::vector<float>       data_f32(ne0*ne1*ne2*ne3);
     std::vector<ggml_fp16_t> data_f16(ne0*ne1*ne2*ne3);
 
-    std::random_device rd;
-    std::mt19937 gen(rd());
+    auto gen = make_test_rng();
     std::uniform_real_distribution<float> dis(min, max);
 
     for (size_t i = 0; i < data_f32.size(); i++) {
@@ -168,12 +215,12 @@ static void init_tensor_kq_mask(ggml_tensor * tensor, float min = -1.0f, float m
     const int n_inf_zero_blocks = 0.2*(ne0*ne1*ne2*ne3)/(blck0*blck1);
 
     for (int b = 0; b < n_inf_zero_blocks; b++) {
-        const int p3 = (rd() % ne3);
-        const int p2 = (rd() % ne2);
-        const int p1 = (rd() % ne1);
-        const int p0 = (rd() % ne0);
+        const int p3 = (gen() % ne3);
+        const int p2 = (gen() % ne2);
+        const int p1 = (gen() % ne1);
+        const int p0 = (gen() % ne0);
 
-        bool inf = rd() & 1;
+        bool inf = gen() & 1;
 
         for (int i1 = 0; i1 < blck1 && p1 + i1 < ne1; i1++) {
             const int idx = p3*ne2*ne1*ne0 + p2*ne1*ne0 + (p1 + i1)*ne0 + p0;
@@ -199,8 +246,7 @@ static void init_tensor_tril(ggml_tensor * tensor, float min = -1.0f, float max 
 
     std::vector<float> data_f32(ne0*ne1*ne2*ne3);
 
-    std::random_device rd;
-    std::mt19937 gen(rd());
+    auto gen = make_test_rng();
     std::uniform_real_distribution<float> dis(min, max);
 
     for (int64_t i3 = 0; i3 < ne3; i3++) {
@@ -1216,6 +1262,7 @@ struct test_case {
     }
 
     virtual bool run_whole_graph() { return false; }
+    virtual bool requires_backend_support() { return false; }
     virtual std::vector<ggml_tensor *> fusion_test_nodes() { return {}; }
     virtual bool use_weight_context() { return false; }
 
@@ -1370,7 +1417,7 @@ struct test_case {
 
             print_test_result_locked(output_printer, result);
 
-            return test_status_t::NOT_SUPPORTED;
+            return requires_backend_support() ? test_status_t::FAIL : test_status_t::NOT_SUPPORTED;
         }
 
         // post-graph sentinel
@@ -2246,6 +2293,7 @@ struct test_swiglu_oai : public test_case {
 // GGML_OP_GET_ROWS
 struct test_get_rows : public test_case {
     const ggml_type type;
+    const ggml_type dst_type;
     const int n; // cols
     const int m; // rows
     const int r; // rows to get
@@ -2254,11 +2302,13 @@ struct test_get_rows : public test_case {
     const bool v; // view (non-contiguous src1)
 
     std::string vars() override {
-        return VARS_TO_STR7(type, n, m, r, be1, be2, v);
+        return VARS_TO_STR8(type, dst_type, n, m, r, be1, be2, v);
     }
 
-    test_get_rows(ggml_type type = GGML_TYPE_F32, int n = 10, int m = 5, int r = 3, int be1 = 1, int be2 = 1, bool v = false)
-        : type(type), n(n), m(m), r(r), be1(be1), be2(be2), v(v) {}
+    test_get_rows(ggml_type type = GGML_TYPE_F32, int n = 10, int m = 5, int r = 3, int be1 = 1, int be2 = 1, bool v = false,
+            ggml_type dst_type = GGML_TYPE_COUNT)
+        : type(type), dst_type(dst_type == GGML_TYPE_COUNT ? (type == GGML_TYPE_I32 ? GGML_TYPE_I32 : GGML_TYPE_F32) : dst_type),
+          n(n), m(m), r(r), be1(be1), be2(be2), v(v) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * in = ggml_new_tensor_4d(ctx, type, n, m, be1, be2);
@@ -2277,7 +2327,7 @@ struct test_get_rows : public test_case {
             // rows is a constant input -> no gradients
         }
 
-        ggml_tensor * out = ggml_get_rows(ctx, in, rows);
+        ggml_tensor * out = ggml_get_rows_as(ctx, in, rows, dst_type);
         ggml_set_name(out, "out");
 
         return out;
@@ -2290,7 +2340,7 @@ struct test_get_rows : public test_case {
                 // rows
                 std::vector<int> data(r*be1*be2);
                 for (int i = 0; i < r*be1*be2; i++) {
-                    data[i] = rand() % m;
+                    data[i] = test_random_u32() % m;
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, r * be1 * be2 * sizeof(int));
             } else {
@@ -2343,7 +2393,7 @@ struct test_get_rows_back : public test_case {
                 // rows
                 std::vector<int> data(r*b);
                 for (int i = 0; i < r*b; i++) {
-                    data[i] = rand() % m;
+                    data[i] = test_random_u32() % m;
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, r * b * sizeof(int));
             } else {
@@ -2354,8 +2404,7 @@ struct test_get_rows_back : public test_case {
 };
 
 static void init_set_rows_row_ids(ggml_tensor * t, int num_rows) {
-    std::random_device rd;
-    std::default_random_engine rng(rd());
+    auto rng = make_test_rng();
     for (int i2 = 0; i2 < t->ne[2]; i2++) {
         for (int i1 = 0; i1 < t->ne[1]; i1++) {
             // generate a shuffled subset of row indices
@@ -2390,9 +2439,11 @@ struct test_set_rows : public test_case {
     const std::array<int, 2> nr23; // broadcast only dims 2 and 3
     const int r; // rows to set
     const bool v; // view (non-contiguous src1)
+    const bool skip; // negative row indices are ignored
+    const bool ordered; // src[5] carries an execution dependency
 
     std::string vars() override {
-        return VARS_TO_STR7(type_src, type_dst, type_idx, ne, nr23, r, v);
+        return VARS_TO_STR9(type_src, type_dst, type_idx, ne, nr23, r, v, skip, ordered);
     }
 
     test_set_rows(ggml_type type_src,
@@ -2400,8 +2451,8 @@ struct test_set_rows : public test_case {
             ggml_type type_idx,
             std::array<int64_t, 4> ne,
             std::array<int, 2> nr23,
-            int r, bool v = false)
-        : type_src(type_src), type_dst(type_dst), type_idx(type_idx), ne(ne), nr23(nr23), r(r), v(v) {}
+            int r, bool v = false, bool skip = false, bool ordered = false)
+        : type_src(type_src), type_dst(type_dst), type_idx(type_idx), ne(ne), nr23(nr23), r(r), v(v), skip(skip), ordered(ordered) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * dst = ggml_new_tensor_4d(ctx, type_dst, ne[0], ne[1], ne[2]*nr23[0], ne[3]*nr23[1]);
@@ -2419,7 +2470,10 @@ struct test_set_rows : public test_case {
             ggml_set_name(row_idxs, "view_of_rows");
         }
 
-        ggml_tensor * out = ggml_set_rows(ctx, dst, src, row_idxs);
+        ggml_tensor * dependency = ordered ? ggml_scale(ctx, src, 1.0f) : nullptr;
+        ggml_tensor * out = ordered ?
+                ggml_set_rows_ordered(ctx, dst, src, row_idxs, dependency) :
+                ggml_set_rows(ctx, dst, src, row_idxs);
         ggml_set_name(out, "out");
 
         return out;
@@ -2432,6 +2486,15 @@ struct test_set_rows : public test_case {
             }
             if (t->type == GGML_TYPE_I64 || t->type == GGML_TYPE_I32) {
                 init_set_rows_row_ids(t, ne[1]);
+                if (skip) {
+                    if (t->type == GGML_TYPE_I64) {
+                        const int64_t skipped = -1;
+                        ggml_backend_tensor_set(t, &skipped, 0, sizeof(skipped));
+                    } else {
+                        const int32_t skipped = -1;
+                        ggml_backend_tensor_set(t, &skipped, 0, sizeof(skipped));
+                    }
+                }
             } else {
                 init_tensor_uniform(t);
             }
@@ -2439,19 +2502,31 @@ struct test_set_rows : public test_case {
     }
 
     double max_nmse_err() override {
-        if (type_dst == GGML_TYPE_Q2_0 || type_dst == GGML_TYPE_Q4_0 || type_dst == GGML_TYPE_Q4_1 ||
-            type_dst == GGML_TYPE_IQ4_NL ||
-            type_dst == GGML_TYPE_Q5_0 || type_dst == GGML_TYPE_Q5_1 || type_dst == GGML_TYPE_Q8_0) {
+        if (type_dst == GGML_TYPE_Q2_0  || type_dst == GGML_TYPE_Q2_0S || type_dst == GGML_TYPE_Q2_1 ||
+            type_dst == GGML_TYPE_Q3_0  || type_dst == GGML_TYPE_Q3_1 ||
+            type_dst == GGML_TYPE_Q4_0  || type_dst == GGML_TYPE_Q4_1 || type_dst == GGML_TYPE_IQ4_NL ||
+            type_dst == GGML_TYPE_Q5_0  || type_dst == GGML_TYPE_Q5_1 ||
+            type_dst == GGML_TYPE_Q6_0  || type_dst == GGML_TYPE_Q6_1 ||
+            type_dst == GGML_TYPE_Q8_0) {
             // estimate what the max nmse error would be if one quantized value is
             // off by one. The test values are distributed in [-1,1], so it'll be
             // roughly (2.0 / 2^bits)^2, divided by the mean square value of the reference,
             // which is roughly 0.25 times the number of elements.
             double err_estimate = 1.0f/8.0f;
+            if (type_dst == GGML_TYPE_Q2_0S || type_dst == GGML_TYPE_Q2_1) {
+                err_estimate *= 4.0f;
+            }
             if (type_src == GGML_TYPE_F16 && type_dst == GGML_TYPE_Q2_0) {
                 err_estimate *= 4.0f;
             }
+            if (type_dst == GGML_TYPE_Q3_0 || type_dst == GGML_TYPE_Q3_1) {
+                err_estimate *= 2.0f;
+            }
             if (type_dst == GGML_TYPE_Q5_0 || type_dst == GGML_TYPE_Q5_1) {
                 err_estimate /= 2.0f;
+            }
+            if (type_dst == GGML_TYPE_Q6_0 || type_dst == GGML_TYPE_Q6_1) {
+                err_estimate /= 4.0f;
             }
             if (type_dst == GGML_TYPE_Q8_0) {
                 err_estimate /= 8.0f;
@@ -2473,6 +2548,67 @@ struct test_set_rows : public test_case {
             return std::max(test_case::max_nmse_err(backend), 2e-7);
         }
         return test_case::max_nmse_err(backend);
+    }
+};
+
+// GGML_OP_SET_ROWS with a quantized body destination and an exact shadow.
+struct test_set_rows_with_shadow : public test_case {
+    const ggml_type body_type;
+    const ggml_type shadow_type;
+    const bool operand_classification;
+
+    test_set_rows_with_shadow(ggml_type body_type, ggml_type shadow_type, bool operand_classification = false)
+        : body_type(body_type), shadow_type(shadow_type), operand_classification(operand_classification) {}
+
+    std::string vars() override {
+        return std::string(operand_classification ? "set_rows_with_shadow_fused_operand_classification," : "") +
+            ggml_type_name(body_type) + "_body," +
+            ggml_type_name(shadow_type) + "_shadow,levels=2";
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        constexpr int64_t n_embd = 256;
+        constexpr int64_t n_rows = 11;
+        constexpr int64_t n_write = 3;
+
+        ggml_tensor * body = ggml_new_tensor_2d(ctx, body_type, n_embd, n_rows);
+        ggml_set_name(body, "body");
+        ggml_tensor * source = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_write);
+        ggml_set_name(source, "source");
+        ggml_tensor * body_indices = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_write);
+        ggml_set_name(body_indices, "body_indices");
+        ggml_tensor * shadow = ggml_new_tensor_2d(ctx, shadow_type, n_embd, n_rows);
+        ggml_set_name(shadow, "shadow");
+        ggml_tensor * shadow_indices = ggml_new_tensor_2d(ctx, GGML_TYPE_I64, n_write, 2);
+        ggml_set_name(shadow_indices, "shadow_indices");
+
+        ggml_tensor * out = ggml_set_rows_with_shadow(
+                ctx, body, source, body_indices, shadow, shadow_indices);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I64) {
+                // Keep writes unique across shadow levels. Conflicting indices
+                // make SET_ROWS intentionally order-dependent and therefore do
+                // not define a portable GPU result.
+                if (strcmp(t->name, "body_indices") == 0) {
+                    const int64_t ids[] = { 0, 2, 4 };
+                    ggml_backend_tensor_set(t, ids, 0, sizeof(ids));
+                } else {
+                    const int64_t ids[] = { 1, 3, 5, 6, 7, 8 };
+                    ggml_backend_tensor_set(t, ids, 0, sizeof(ids));
+                }
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    double max_nmse_err() override {
+        return 1e-7;
     }
 };
 
@@ -2563,7 +2699,7 @@ struct test_rope_set_rows : public test_case {
                 const int num_pos_ids = (mode & GGML_ROPE_TYPE_MROPE) ? ne_a[2] * 4 : ne_a[2];
                 std::vector<int> data(num_pos_ids);
                 for (int i = 0; i < num_pos_ids; i++) {
-                    data[i] = rand() % n_ctx;
+                    data[i] = test_random_u32() % n_ctx;
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, num_pos_ids * sizeof(int));
             } else {
@@ -2678,8 +2814,7 @@ struct test_argmax : public test_case {
     }
 
     void initialize_tensors(ggml_context * ctx) override {
-        std::random_device rd;
-        std::default_random_engine rng(rd());
+        auto rng = make_test_rng();
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (t->type == GGML_TYPE_F32) {
                 // initialize with unique values to avoid ties
@@ -2739,8 +2874,7 @@ struct test_count_equal : public test_case {
     }
 
     void initialize_tensors(ggml_context * ctx) override {
-        std::random_device rd;
-        std::default_random_engine rng(rd());
+        auto rng = make_test_rng();
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (t->type == GGML_TYPE_F32) {
                 // initialize with unique values to avoid ties
@@ -3061,36 +3195,28 @@ struct test_cpy : public test_case {
 };
 
 // GGML_OP_CONT
-// permute = {0, 0, 0, 0} means no permutation: the source is transposed (or
-// view-sliced). A non-identity permute applies ggml_permute before ggml_cont.
 struct test_cont : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne;
     bool use_view_slice;
-    const std::array<int64_t, 4> permute;
 
     std::string vars() override {
-        return VARS_TO_STR4(type, ne, use_view_slice, permute);
+        return VARS_TO_STR3(type, ne, use_view_slice);
     }
 
     test_cont(ggml_type type = GGML_TYPE_F32,
             std::array<int64_t, 4> ne = {10, 10, 10, 1},
-            bool use_view_slice = false,
-            std::array<int64_t, 4> permute = {0, 0, 0, 0})
-        : type(type), ne(ne), use_view_slice(use_view_slice), permute(permute) {}
+            bool use_view_slice = false)
+        : type(type), ne(ne), use_view_slice(use_view_slice) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * src = ggml_new_tensor(ctx, type, 4, ne.data());
         ggml_set_param(src);
         ggml_set_name(src, "src");
 
-        const bool permuted = permute[0] != 0 || permute[1] != 0 || permute[2] != 0 || permute[3] != 0;
 
         ggml_tensor * dst;
-        if (permuted) {
-            dst = ggml_permute(ctx, src, permute[0], permute[1], permute[2], permute[3]);
-            ggml_set_name(dst, "src_permuted");
-        } else if (use_view_slice) {
+        if (use_view_slice) {
             dst = ggml_view_4d(ctx, src, src->ne[0], 1, src->ne[2], src->ne[3],
                 src->nb[1], src->nb[2], src->nb[3], src->nb[0] * (src->ne[1] - 1));
             ggml_set_name(dst, "src_view_slice");
@@ -3250,8 +3376,7 @@ struct test_add_id : public test_case {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (t->type == GGML_TYPE_I32) {
                 if (ggml_is_view_op(t->op)) { continue; }
-                std::random_device rd;
-                std::default_random_engine rng(rd());
+                auto rng = make_test_rng();
                 // ids
                 for (int64_t r = 0; r < ggml_nrows(t); r++) {
                     std::vector<int32_t> data(t->ne[0]);
@@ -3703,117 +3828,6 @@ struct test_relu_sqr : public test_case {
     }
 };
 
-// GGML_OP_UNARY(SILU|SIGMOID|SOFTPLUS) + GGML_OP_MUL (fused operation).
-// `layout` and `tail` are used for fallback cases where fusion must be skipped
-struct test_unary_mul : public test_case {
-    const ggml_unary_op op;
-    const ggml_type type;
-    const std::array<int64_t, 4> ne;
-    const bool swap;          // unary result is the second MUL operand
-    const std::string layout; // operand layout, see build_graph()
-    const std::string tail;   // extra consumer past the MUL, see build_graph()
-
-    std::string op_desc(ggml_tensor * t) override {
-        GGML_UNUSED(t);
-        return std::string(ggml_unary_op_name(op)) + "_MUL";
-    }
-
-    bool run_whole_graph() override { return true; }
-
-    double max_nmse_err() override {
-        // the fused kernel elides the rounding of the unary result that the CPU chain
-        // performs; relax the tolerance to match that drift
-        switch (type) {
-            case GGML_TYPE_F16: return 5e-5;
-            default:            return 1e-7;
-        }
-    }
-
-    std::string vars() override {
-        return VARS_TO_STR5(type, ne, swap, layout, tail);
-    }
-
-    test_unary_mul(ggml_unary_op op,
-            ggml_type type = GGML_TYPE_F32,
-            std::array<int64_t, 4> ne = {128, 2, 2, 2},
-            bool swap = false,
-            std::string layout = "packed",
-            std::string tail = "")
-        : op(op), type(type), ne(ne), swap(swap), layout(std::move(layout)), tail(std::move(tail)) {}
-
-    // `ne` viewed out of a wider tensor: rows stay contiguous, but the stride exceeds the width
-    ggml_tensor * padded(ggml_context * ctx, const char * name, int64_t mul0, int64_t off0) {
-        std::array<int64_t, 4> ne_w = ne;
-        ne_w[0] *= mul0;
-        ggml_tensor * base = ggml_new_tensor(ctx, type, 4, ne_w.data());
-        ggml_set_name(base, name);
-        return ggml_view_4d(ctx, base, ne[0], ne[1], ne[2], ne[3],
-                            base->nb[1], base->nb[2], base->nb[3], off0 * base->nb[0]);
-    }
-
-    ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * a = nullptr; // unary source
-        ggml_tensor * b = nullptr; // other MUL operand
-
-        if (layout == "packed") {
-            a = ggml_new_tensor(ctx, type, 4, ne.data());
-            b = ggml_new_tensor(ctx, type, 4, ne.data());
-        } else if (layout == "pad_unary") {
-            a = padded(ctx, "a", 3, 0);
-            b = ggml_new_tensor(ctx, type, 4, ne.data());
-        } else if (layout == "pad_other") {
-            a = ggml_new_tensor(ctx, type, 4, ne.data());
-            b = padded(ctx, "b", 3, 0);
-        } else if (layout == "halves") {
-            // the shape the Conformer audio encoders build: one tensor split in two
-            std::array<int64_t, 4> ne_w = ne;
-            ne_w[0] *= 2;
-            ggml_tensor * base = ggml_new_tensor(ctx, type, 4, ne_w.data());
-            ggml_set_name(base, "base");
-            b = ggml_view_4d(ctx, base, ne[0], ne[1], ne[2], ne[3], base->nb[1], base->nb[2], base->nb[3], 0);
-            a = ggml_view_4d(ctx, base, ne[0], ne[1], ne[2], ne[3], base->nb[1], base->nb[2], base->nb[3],
-                             ne[0] * base->nb[0]);
-        } else if (layout == "strided_dim1") {
-            // contiguous rows but a strided dim 1: not ggml_is_contiguous_1, must not fuse
-            std::array<int64_t, 4> ne_w = ne;
-            ne_w[1] *= 3;
-            ggml_tensor * base = ggml_new_tensor(ctx, type, 4, ne_w.data());
-            ggml_set_name(base, "a");
-            a = ggml_view_4d(ctx, base, ne[0], ne[1], ne[2], ne[3], base->nb[1], base->nb[2], base->nb[3], 0);
-            b = ggml_new_tensor(ctx, type, 4, ne.data());
-        } else if (layout == "bcast") {
-            a = ggml_new_tensor(ctx, type, 4, ne.data());
-            b = ggml_new_tensor_4d(ctx, type, ne[0], 1, 1, 1);
-        } else {
-            GGML_ABORT("unknown layout %s", layout.c_str());
-        }
-        ggml_set_name(a, "a");
-        ggml_set_name(b, "b");
-
-        ggml_tensor * u = ggml_unary(ctx, a, op);
-        ggml_set_name(u, "unary");
-
-        // a broadcasting operand can only be the second one
-        const bool second = swap && layout != "bcast";
-        ggml_tensor * out = second ? ggml_mul(ctx, b, u) : ggml_mul(ctx, u, b);
-
-        if (tail == "reuse") {
-            // a second read of the unary result must block the fusion
-            ggml_set_name(out, "mul");
-            out = ggml_add(ctx, out, u);
-        } else if (tail == "consumer") {
-            // fusion still applies; catches a dispatcher that skips one node too many
-            ggml_set_name(out, "mul");
-            out = ggml_add(ctx, out, b);
-        } else if (!tail.empty()) {
-            GGML_ABORT("unknown tail %s", tail.c_str());
-        }
-        ggml_set_name(out, "out");
-
-        return out;
-    }
-};
-
 // SNAKE activation fusion: y = x + sin(a*x)^2 * inv_b
 // CUDA backend matches the naive 5-op chain (mul, sin, sqr, mul, add)
 // and dispatches a single fused kernel.
@@ -4169,8 +4183,7 @@ struct test_ssm_scan : public test_case {
 
 
     void initialize_tensors(ggml_context * ctx) override {
-        std::random_device rd;
-        std::default_random_engine rng(rd());
+        auto rng = make_test_rng();
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (t->type == GGML_TYPE_I32) {
                 if (ggml_is_view_op(t->op)) { continue; }
@@ -4187,114 +4200,6 @@ struct test_ssm_scan : public test_case {
                 continue;
             } else if (t->ne[1] == n_head && t->ne[2] == 1) {
                 // A {1 or d_state, n_head}: negative decay (2-D tensor, ne[2]==1 distinguishes from 3-D/4-D tensors)
-                init_tensor_uniform(t, -1.0f, -0.5f);
-            } else {
-                init_tensor_uniform(t);
-            }
-        }
-    }
-};
-
-struct test_ssm_scan_rollback : public test_case {
-    const ggml_type type;
-
-    const int64_t d_state;
-    const int64_t head_dim;
-    const int64_t n_head;
-    const int64_t n_group;
-    const int64_t n_seq_tokens;
-    const int64_t n_seqs;
-    const int64_t K;
-
-    std::string vars() override {
-        return VARS_TO_STR8(type, d_state, head_dim, n_head, n_group, n_seq_tokens, n_seqs, K);
-    }
-
-    std::string op_desc(ggml_tensor * t) override {
-        GGML_UNUSED(t);
-        return "SSM_SCAN_ROLLBACK";
-    }
-
-    bool run_whole_graph() override {
-        return true;
-    }
-
-    double max_err() override {
-        return 1e-6;
-    }
-
-    double err(const float * a, const float * b, size_t n) override {
-        double result = 0.0;
-        for (size_t i = 0; i < n; ++i) {
-            result = std::max(result, (double) fabsf(a[i]));
-            result = std::max(result, (double) fabsf(b[i]));
-        }
-        return result;
-    }
-
-    test_ssm_scan_rollback(ggml_type type = GGML_TYPE_F32,
-            int64_t d_state = 32,
-            int64_t head_dim = 64,
-            int64_t n_head  = 16,
-            int64_t n_group = 2,
-            int64_t n_seq_tokens = 8,
-            int64_t n_seqs = 2,
-            int64_t K = 3)
-        : type(type), d_state(d_state), head_dim(head_dim), n_head(n_head), n_group(n_group),
-          n_seq_tokens(n_seq_tokens), n_seqs(n_seqs), K(K) {}
-
-    ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * s   = ggml_new_tensor_4d(ctx, type, d_state,  head_dim,     n_head,       n_seqs);
-        ggml_tensor * x   = ggml_new_tensor_4d(ctx, type, head_dim, n_head,       n_seq_tokens, n_seqs);
-        ggml_tensor * dt  = ggml_new_tensor_3d(ctx, type, n_head,   n_seq_tokens, n_seqs);
-        ggml_tensor * A   = ggml_new_tensor_2d(ctx, type, 1,        n_head);
-        ggml_tensor * B   = ggml_new_tensor_4d(ctx, type, d_state,  n_group,      n_seq_tokens, n_seqs);
-        ggml_tensor * C   = ggml_new_tensor_4d(ctx, type, d_state,  n_group,      n_seq_tokens, n_seqs);
-        ggml_tensor * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32,  n_seqs);
-
-        ggml_tensor * full = ggml_ssm_scan(ctx, s, x, dt, A, B, C, ids, K);
-
-        const int64_t y_elems     = head_dim * n_head * n_seq_tokens * n_seqs;
-        const int64_t state_elems = d_state  * head_dim * n_head      * n_seqs;
-
-        ggml_tensor * out = nullptr;
-        for (int64_t slot = 0; slot < K; ++slot) {
-            const int64_t prefix_tokens = n_seq_tokens - slot;
-
-            ggml_tensor * x_prefix  = ggml_cont(ctx, ggml_view_4d(ctx, x,  head_dim, n_head,  prefix_tokens, n_seqs, x->nb[1],  x->nb[2],  x->nb[3],  0));
-            ggml_tensor * dt_prefix = ggml_cont(ctx, ggml_view_3d(ctx, dt, n_head,   prefix_tokens, n_seqs, dt->nb[1], dt->nb[2], 0));
-            ggml_tensor * B_prefix  = ggml_cont(ctx, ggml_view_4d(ctx, B,  d_state,  n_group, prefix_tokens, n_seqs, B->nb[1],  B->nb[2],  B->nb[3],  0));
-            ggml_tensor * C_prefix  = ggml_cont(ctx, ggml_view_4d(ctx, C,  d_state,  n_group, prefix_tokens, n_seqs, C->nb[1],  C->nb[2],  C->nb[3],  0));
-
-            ggml_tensor * prefix = ggml_ssm_scan(ctx, s, x_prefix, dt_prefix, A, B_prefix, C_prefix, ids, /*K=*/1);
-
-            ggml_tensor * full_state   = ggml_view_1d(ctx, full,   state_elems, (y_elems + slot*state_elems)*ggml_element_size(full));
-            ggml_tensor * prefix_state = ggml_view_1d(ctx, prefix, state_elems, (head_dim*n_head*prefix_tokens*n_seqs)*ggml_element_size(prefix));
-            ggml_tensor * diff         = ggml_sum(ctx, ggml_sqr(ctx, ggml_sub(ctx, full_state, prefix_state)));
-
-            out = out == nullptr ? diff : ggml_add(ctx, out, diff);
-        }
-
-        return out;
-    }
-
-    void initialize_tensors(ggml_context * ctx) override {
-        std::random_device rd;
-        std::default_random_engine rng(rd());
-        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
-            if (t->type == GGML_TYPE_I32) {
-                if (ggml_is_view_op(t->op)) { continue; }
-                for (int64_t r = 0; r < ggml_nrows(t); r++) {
-                    std::vector<int32_t> data(t->ne[0]);
-                    for (int i = 0; i < t->ne[0]; i++) {
-                        data[i] = i;
-                    }
-                    std::shuffle(data.begin(), data.end(), rng);
-                    ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
-                }
-            } else if (ggml_is_view_op(t->op)) {
-                continue;
-            } else if (t->ne[1] == n_head && t->ne[2] == 1) {
                 init_tensor_uniform(t, -1.0f, -0.5f);
             } else {
                 init_tensor_uniform(t);
@@ -4478,10 +4383,18 @@ struct test_mul_mat : public test_case {
     const std::array<int64_t, 4> per; // permutation of dimensions
     const int64_t k_v; // size of k in memory, resulting in a non-contiguous view for k_v > k, no view for k_v == 0
     const uint32_t o; // number of outputs
-    const bool src_overlap; // a and b are overlapping views of the same tensor
+    const int64_t k_v_rhs; // optional RHS-only physical k; -1 preserves the shared k_v behavior
+    const size_t rhs_offset; // byte offset of the RHS view
 
     std::string vars() override {
-        return VARS_TO_STR11(type_a, type_b, m, n, k, bs, nr, per, k_v, o, src_overlap);
+        std::string result = VARS_TO_STR10(type_a, type_b, m, n, k, bs, nr, per, k_v, o);
+        if (k_v_rhs >= 0) {
+            result += ",k_v_rhs=" + std::to_string(k_v_rhs);
+        }
+        if (rhs_offset != 0) {
+            result += ",rhs_offset=" + std::to_string(rhs_offset);
+        }
+        return result;
     }
 
     double max_nmse_err() override {
@@ -4510,8 +4423,9 @@ struct test_mul_mat : public test_case {
             std::array<int64_t, 2> bs = {10, 10},
             std::array<int64_t, 2> nr = {2, 2},
             std::array<int64_t, 4> per = {0, 1, 2, 3},
-            int64_t k_v = 0, uint32_t o = 1, bool src_overlap = false)
-        : type_a(type_a), type_b(type_b), m(m), n(n), k(k), bs(bs), nr(nr), per(per), k_v(k_v), o(o), src_overlap(src_overlap) {}
+            int64_t k_v = 0, uint32_t o = 1, int64_t k_v_rhs = -1, size_t rhs_offset = 0)
+        : type_a(type_a), type_b(type_b), m(m), n(n), k(k), bs(bs), nr(nr), per(per), k_v(k_v), o(o),
+          k_v_rhs(k_v_rhs), rhs_offset(rhs_offset) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         // C^T = A * B^T: (k, m) * (k, n) => (m, n)
@@ -4522,6 +4436,8 @@ struct test_mul_mat : public test_case {
         if (npermuted > 0) {
             GGML_ASSERT(npermuted == 2);
             GGML_ASSERT(k_v == 0); // not handled
+            GGML_ASSERT(k_v_rhs == -1); // not handled
+            GGML_ASSERT(rhs_offset == 0); // not handled
             GGML_ASSERT(!ggml_is_quantized(type_a) || per[0] == 0);
             GGML_ASSERT(!ggml_is_quantized(type_b) || per[0] == 0);
 
@@ -4544,22 +4460,14 @@ struct test_mul_mat : public test_case {
             b = ggml_permute(ctx, b, per[0], per[1], per[2], per[3]);
             ggml_set_name(a, "a_permuted");
             ggml_set_name(b, "b_permuted");
-        } else if (src_overlap) {
-            GGML_ASSERT(type_a == type_b);
-            GGML_ASSERT(k_v == 0);
-
-            // a and b are interleaved views of the same tensor: (e.g. fused QKV in MiniMax-01)
-            ggml_tensor * base = ggml_new_tensor_4d(ctx, type_a, 2*k, std::max(m, n), bs[0]*nr[0], bs[1]*nr[1]);
-            ggml_set_name(base, "base");
-
-            a = ggml_view_4d(ctx, base, k, m, bs[0],       bs[1],       base->nb[1], base->nb[2], base->nb[3], 0);
-            b = ggml_view_4d(ctx, base, k, n, bs[0]*nr[0], bs[1]*nr[1], base->nb[1], base->nb[2], base->nb[3], k*ggml_type_size(type_a));
-            ggml_set_name(a, "a");
-            ggml_set_name(b, "b");
         } else {
-            const int64_t k_physical = k_v == 0 ? k : k_v;
-            a = ggml_new_tensor_4d(ctx, type_a, k_physical, m, bs[0],       bs[1]);
-            b = ggml_new_tensor_4d(ctx, type_b, k_physical, n, bs[0]*nr[0], bs[1]*nr[1]);
+            const int64_t k_physical_a = k_v == 0 ? k : k_v;
+            const int64_t k_physical_b = k_v_rhs < 0 ? k_physical_a : (k_v_rhs == 0 ? k : k_v_rhs);
+            GGML_ASSERT(k_physical_a >= k);
+            GGML_ASSERT(k_physical_b >= k);
+            GGML_ASSERT(rhs_offset % ggml_type_size(type_b) == 0);
+            a = ggml_new_tensor_4d(ctx, type_a, k_physical_a, m, bs[0],       bs[1]);
+            b = ggml_new_tensor_4d(ctx, type_b, k_physical_b, n, bs[0]*nr[0], bs[1]*nr[1]);
 
             if (!ggml_is_quantized(type_a)) {
                 if (bs[1] == 1 && nr[1] == 1) {
@@ -4568,10 +4476,13 @@ struct test_mul_mat : public test_case {
                 ggml_set_param(b);
             }
 
-            if (k_v != 0) {
-                GGML_ASSERT(k_v > k);
+            if (k_physical_a != k) {
                 a = ggml_view_4d(ctx, a, k, m, bs[0],       bs[1],       a->nb[1], a->nb[2], a->nb[3], 0);
-                b = ggml_view_4d(ctx, b, k, n, bs[0]*nr[0], bs[1]*nr[1], b->nb[1], b->nb[2], b->nb[3], 0);
+            }
+            if (k_physical_b != k || rhs_offset != 0) {
+                b = ggml_view_4d(
+                    ctx, b, k, n, bs[0]*nr[0], bs[1]*nr[1],
+                    b->nb[1], b->nb[2], b->nb[3], rhs_offset);
             }
             ggml_set_name(a, "a");
             ggml_set_name(b, "b");
@@ -4650,8 +4561,7 @@ struct test_mul_mat_hadamard : public test_mul_mat {
 };
 
 static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats) {
-    std::random_device rd;
-    std::default_random_engine rng(rd());
+    auto rng = make_test_rng();
     for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
         if (t->type == GGML_TYPE_I32) {
             if (ggml_is_view_op(t->op)) { continue; }
@@ -4680,9 +4590,18 @@ struct test_mul_mat_id : public test_case {
     const int64_t m;
     const int64_t n;
     const int64_t k;
+    const int64_t k_v_rhs;
+    const size_t rhs_offset;
 
     std::string vars() override {
-        return VARS_TO_STR8(type_a, type_b, n_mats, n_used, b, m, n, k);
+        std::string result = VARS_TO_STR8(type_a, type_b, n_mats, n_used, b, m, n, k);
+        if (k_v_rhs >= 0) {
+            result += ",k_v_rhs=" + std::to_string(k_v_rhs);
+        }
+        if (rhs_offset != 0) {
+            result += ",rhs_offset=" + std::to_string(rhs_offset);
+        }
+        return result;
     }
 
     double max_nmse_err() override {
@@ -4704,9 +4623,10 @@ struct test_mul_mat_id : public test_case {
 
     test_mul_mat_id(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
             int n_mats = 8, int n_used = 2, bool b = false,
-            int64_t m = 32, int64_t n = 32, int64_t k = 32)
+            int64_t m = 32, int64_t n = 32, int64_t k = 32,
+            int64_t k_v_rhs = -1, size_t rhs_offset = 0)
         : type_a(type_a), type_b(type_b), n_mats(n_mats), n_used(n_used), b(b),
-            m(m), n(n), k(k) {
+            m(m), n(n), k(k), k_v_rhs(k_v_rhs), rhs_offset(rhs_offset) {
             GGML_ASSERT(n_used <= n_mats);
         }
 
@@ -4722,7 +4642,13 @@ struct test_mul_mat_id : public test_case {
             ggml_set_name(ids, "view_of_ids");
         }
 
-        ggml_tensor * b = ggml_new_tensor_3d(ctx, type_b, k, this->b ? 1 : n_used, n);
+        const int64_t k_physical_b = k_v_rhs < 0 ? k : k_v_rhs;
+        GGML_ASSERT(k_physical_b >= k);
+        GGML_ASSERT(rhs_offset % ggml_type_size(type_b) == 0);
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, type_b, k_physical_b, this->b ? 1 : n_used, n);
+        if (k_physical_b != k || rhs_offset != 0) {
+            b = ggml_view_3d(ctx, b, k, this->b ? 1 : n_used, n, b->nb[1], b->nb[2], rhs_offset);
+        }
         ggml_set_name(b, "b");
 
         ggml_tensor * out = ggml_mul_mat_id(ctx, as, b, ids);
@@ -5352,27 +5278,24 @@ struct test_rope : public test_case {
     int v; // view (1 : non-contiguous a)
     bool forward;
     bool inplace;
-    int n_offs; // offset of the rotated dims window, set via ggml_rope_set_offset()
 
     std::string vars() override {
         // forward can be inferred from the op, does not need to be printed
-        return VARS_TO_STR12(type, ne_a, n_dims, mode, n_ctx, fs, ef, af, ff, v, inplace, n_offs);
+        return VARS_TO_STR11(type, ne_a, n_dims, mode, n_ctx, fs, ef, af, ff, v, inplace);
     }
 
     test_rope(ggml_type type = GGML_TYPE_F32,
             std::array<int64_t, 4> ne_a = {10, 5, 3, 1},
             int n_dims = 10, int mode = GGML_ROPE_TYPE_NORMAL, int n_ctx = 512, float fs = 1.0f,
-            float ef = 0.0f, float af = 0.0f, bool ff = false, int v = 0, bool forward = true, bool inplace = false,
-            int n_offs = 0)
-        : type(type), ne_a(ne_a), n_dims(n_dims), mode(mode), n_ctx(n_ctx), fs(fs), ef(ef), af(af), ff(ff), v(v), forward(forward), inplace(inplace), n_offs(n_offs) {}
+            float ef = 0.0f, float af = 0.0f, bool ff = false, int v = 0, bool forward = true, bool inplace = false)
+        : type(type), ne_a(ne_a), n_dims(n_dims), mode(mode), n_ctx(n_ctx), fs(fs), ef(ef), af(af), ff(ff), v(v), forward(forward), inplace(inplace) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a;
         if (v & 1) {
             auto ne = ne_a; ne[0] *= 2; ne[1] *= 4; ne[2] *= 3;
             a = ggml_new_tensor(ctx, type, 4, ne.data());
-            if (forward && n_offs == 0) {
-                // FIXME: support gradients with n_offs > 0
+            if (forward) {
                 ggml_set_param(a);
             }
             ggml_set_name(a, "a");
@@ -5385,8 +5308,7 @@ struct test_rope : public test_case {
             // non-aligned buffer offset, which exercises backends' alignment paths.
             auto ne = ne_a; ne[0] *= 2;
             a = ggml_new_tensor(ctx, type, 4, ne.data());
-            if (forward && n_offs == 0) {
-                // FIXME: support gradients with n_offs > 0
+            if (forward) {
                 ggml_set_param(a);
             }
             ggml_set_name(a, "a");
@@ -5397,8 +5319,7 @@ struct test_rope : public test_case {
             ggml_set_name(a, "view_of_a");
         } else {
             a = ggml_new_tensor(ctx, type, 4, ne_a.data());
-            if (forward && n_offs == 0) {
-                // FIXME: support gradients with n_offs > 0
+            if (forward) {
                 ggml_set_param(a);
             }
             ggml_set_name(a, "a");
@@ -5459,9 +5380,6 @@ struct test_rope : public test_case {
                 out = ggml_rope_ext_back(ctx, a, pos, freq, n_dims, mode, 0, 10000.0f, fs, ef, af, 1.0f, 1.0f);
             }
         }
-        if (n_offs != 0) {
-            out = ggml_rope_set_offset(out, n_offs);
-        }
         ggml_set_name(out, "out");
 
         return out;
@@ -5474,7 +5392,7 @@ struct test_rope : public test_case {
                 const int num_pos_ids = (mode & GGML_ROPE_TYPE_MROPE) ? ne_a[2] * 4 : ne_a[2];
                 std::vector<int> data(num_pos_ids);
                 for (int i = 0; i < num_pos_ids; i++) {
-                    data[i] = rand() % n_ctx;
+                    data[i] = test_random_u32() % n_ctx;
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, num_pos_ids * sizeof(int));
             } else {
@@ -6074,14 +5992,13 @@ struct test_argsort : public test_case {
     }
 
     void initialize_tensors(ggml_context * ctx) override {
-        std::random_device rd;
-        std::default_random_engine rng(rd());
+        auto rng = make_test_rng();
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (t->type == GGML_TYPE_I32) {
                 // indices
                 std::vector<int> data(ggml_nelements(t));
                 for (int i = 0; i < ggml_nelements(t); i++) {
-                    data[i] = rand();
+                    data[i] = static_cast<int>(test_random_u32());
                 }
                 std::shuffle(data.begin(), data.end(), rng);
                 ggml_backend_tensor_set(t, data.data(), 0, ne[0]*ne[1]*ne[2]*ne[3] * sizeof(int));
@@ -6202,8 +6119,7 @@ struct test_top_k : public test_case {
     }
 
     void initialize_tensors(ggml_context * ctx) override {
-        std::random_device rd;
-        std::default_random_engine rng(rd());
+        auto rng = make_test_rng();
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             int tie_denom = std::max(1, std::min(10, k / 2));
             for (int64_t r = 0; r < ggml_nrows(t); r++) {
@@ -6343,19 +6259,31 @@ struct test_mul_mat_vec_fusion : public test_case {
     const bool with_gate;
     const bool with_lane_scale;
     std::array<int64_t, 2> batch_dims;
+    const int64_t k_v_rhs;
+    const size_t rhs_offset;
 
     test_mul_mat_vec_fusion(ggml_type type, ggml_glu_op op, int64_t m, int64_t n, int64_t k,
                         bool use_id = false, int n_mats = 1, int n_used = 1, bool b = false, bool with_bias = false, bool with_gate = true,
-                        bool with_lane_scale = false, std::array<int64_t, 2> batch_dims = {4, 2})
+                        bool with_lane_scale = false, std::array<int64_t, 2> batch_dims = {4, 2},
+                        int64_t k_v_rhs = -1, size_t rhs_offset = 0)
     : type(type), glu_op(op), m(m), n(n), k(k), use_id(use_id), n_mats(n_mats), n_used(n_used), b(b), with_bias(with_bias),
-        with_gate(with_gate), with_lane_scale(with_lane_scale), batch_dims(batch_dims) {
+        with_gate(with_gate), with_lane_scale(with_lane_scale), batch_dims(batch_dims), k_v_rhs(k_v_rhs),
+        rhs_offset(rhs_offset) {
         if (use_id) {
             GGML_ASSERT(n_used <= n_mats);
         }
     }
 
     std::string vars() override {
-        return VARS_TO_STR13(type, glu_op, m, n, k, use_id, n_mats, n_used, b, with_bias, with_gate, with_lane_scale, batch_dims);
+        std::string result =
+            VARS_TO_STR13(type, glu_op, m, n, k, use_id, n_mats, n_used, b, with_bias, with_gate, with_lane_scale, batch_dims);
+        if (k_v_rhs >= 0) {
+            result += ",k_v_rhs=" + std::to_string(k_v_rhs);
+        }
+        if (rhs_offset != 0) {
+            result += ",rhs_offset=" + std::to_string(rhs_offset);
+        }
+        return result;
     }
 
     std::string op_desc(ggml_tensor * t) override {
@@ -6403,10 +6331,17 @@ struct test_mul_mat_vec_fusion : public test_case {
         if (!use_id) {
             const int              channels = batch_dims[0];
             const int              samples  = batch_dims[1];
-            std::array<int64_t, 4> ne       = { k, m, channels, samples };
+            std::array<int64_t, 4> ne_cur   = { k_v_rhs < 0 ? k : k_v_rhs, m, channels, samples };
             std::array<int64_t, 4> ne0      = { k, n, channels, samples };
 
-            ggml_tensor * cur  = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+            GGML_ASSERT(ne_cur[0] >= k);
+            GGML_ASSERT(rhs_offset % sizeof(float) == 0);
+            ggml_tensor * cur  = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne_cur.data());
+            if (ne_cur[0] != k || rhs_offset != 0) {
+                cur = ggml_view_4d(
+                    ctx, cur, k, m, channels, samples,
+                    cur->nb[1], cur->nb[2], cur->nb[3], rhs_offset);
+            }
             ggml_tensor * gate = with_gate ? ggml_new_tensor(ctx, type, 4, ne0.data()) : nullptr;
             ggml_tensor * up   = ggml_new_tensor(ctx, type, 4, ne0.data());
 
@@ -6456,7 +6391,15 @@ struct test_mul_mat_vec_fusion : public test_case {
                 ids = ggml_view_2d(ctx, ids, n_used, m, ids->nb[1], 0);
             }
 
-            ggml_tensor * cur = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, this->b ? 1 : n_used, m);
+            const int64_t k_physical = k_v_rhs < 0 ? k : k_v_rhs;
+            GGML_ASSERT(k_physical >= k);
+            GGML_ASSERT(rhs_offset % sizeof(float) == 0);
+            ggml_tensor * cur = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k_physical, this->b ? 1 : n_used, m);
+            if (k_physical != k || rhs_offset != 0) {
+                cur = ggml_view_3d(
+                    ctx, cur, k, this->b ? 1 : n_used, m,
+                    cur->nb[1], cur->nb[2], rhs_offset);
+            }
             ggml_set_name(cur, "cur");
 
             auto build_lane_up = [&]() {
@@ -6962,25 +6905,18 @@ struct test_roll : public test_case {
     const int shift1;
     const int shift3;
     const int shift4;
-    const bool permute;
 
     std::string vars() override {
-        return VARS_TO_STR5(shift0, shift1, shift3, shift4, permute);
+        return VARS_TO_STR4(shift0, shift1, shift3, shift4);
     }
 
-    test_roll(int shift0 = 3, int shift1 = -2, int shift3 = 1, int shift4 = -1, bool permute = false)
-        : shift0(shift0), shift1(shift1), shift3(shift3), shift4(shift4), permute(permute) {}
+    test_roll(int shift0 = 3, int shift1 = -2, int shift3 = 1, int shift4 = -1)
+        : shift0(shift0), shift1(shift1), shift3(shift3), shift4(shift4) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         int64_t ne[4] = {10, 5, 4, 3};
         ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
         ggml_set_name(a, "a");
-
-        if (permute) {
-            // ggml_roll only requires nb[0] == type size, so a permuted src is valid
-            a = ggml_permute(ctx, a, 0, 2, 1, 3);
-            ggml_set_name(a, "a_permuted");
-        }
 
         ggml_tensor * out = ggml_roll(ctx, a, shift0, shift1, shift3, shift4);
         ggml_set_name(out, "out");
@@ -7084,14 +7020,77 @@ struct test_flash_attn_ext : public test_case {
     const ggml_type type_K;
     const ggml_type type_V;
     std::array<int32_t, 4> permute;
-    const bool kv_view; // create K/V as views of a larger buffer (like a KV cache)
+    const int64_t n_tail;
+    const bool tail_only;
+    const ggml_type type_tail_k;
+    const ggml_type type_tail_v;
+    const bool tail_interleaved;
+    const bool tail_all_masked;
+    const bool canonical_body;
+    const bool full_coverage_equivalence;
+    const bool split_equivalence;
+    const int64_t n_tail_current;
+    const bool segmented_equivalence;
+    const float scale;
+    const int64_t n_tail_active;
+    const int64_t n_tail_history_slots;
 
     std::string vars() override {
-        return VARS_TO_STR15(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view);
+        return VARS_TO_STR14(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute) +
+            " n_tail=" + std::to_string(n_tail) + " tail_only=" + std::to_string(int(tail_only)) +
+            " type_tail_k=" + ggml_type_name(type_tail_k) + " type_tail_v=" + ggml_type_name(type_tail_v) +
+            " tail_interleaved=" + std::to_string(int(tail_interleaved)) +
+            " tail_all_masked=" + std::to_string(int(tail_all_masked)) +
+            " canonical_body=" + std::to_string(int(canonical_body)) +
+            " full_coverage_equivalence=" + std::to_string(int(full_coverage_equivalence)) +
+            " split_equivalence=" + std::to_string(int(split_equivalence)) +
+            " n_tail_current=" + std::to_string(n_tail_current) +
+            " segmented_equivalence=" + std::to_string(int(segmented_equivalence)) +
+            " scale=" + std::to_string(scale) +
+            " n_tail_active=" + std::to_string(n_tail_active) +
+            " n_tail_history_slots=" + std::to_string(n_tail_history_slots);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        return full_coverage_equivalence ? "KV_TAIL_EQUIVALENCE" :
+            (segmented_equivalence ? "KV_TAIL_SEGMENTED_EQUIVALENCE" :
+             (split_equivalence ? "KV_TAIL_SPLIT_EQUIVALENCE" : test_case::op_desc(t)));
+    }
+
+    bool run_whole_graph() override {
+        return full_coverage_equivalence || split_equivalence || segmented_equivalence;
+    }
+
+    bool requires_backend_support() override {
+        // This is the exact mixed Gemma global-layer regression.  It is not
+        // optional coverage: planning advertises the composite as executable,
+        // so silently reporting NOT_SUPPORTED would recreate a scheduler CPU
+        // fallback in the model graph.
+        return hsk == 512 && hsv == 512 && nr23[0] == 8 &&
+            type_K == GGML_TYPE_Q4_0 && type_V == GGML_TYPE_Q4_0 &&
+            canonical_body && n_tail_current > 0;
     }
 
     double max_nmse_err() override {
         return 5e-4;
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        if (!full_coverage_equivalence && !split_equivalence && !segmented_equivalence) {
+            return test_case::err(a, b, n);
+        }
+
+        GGML_ASSERT(n % 2 == 0);
+        const size_t half = n/2;
+        if (split_equivalence || segmented_equivalence) {
+            return std::max(
+                    nmse(a, a + half, half),
+                    nmse(b, b + half, half));
+        }
+        return std::max({
+                nmse(a,        a + half, half),
+                nmse(b,        b + half, half),
+                nmse(a,        b,        n) });
     }
 
     uint64_t op_flops(ggml_tensor * t) override {
@@ -7104,9 +7103,20 @@ struct test_flash_attn_ext : public test_case {
     test_flash_attn_ext(int64_t hsk = 128, int64_t hsv = 128, int64_t nh = 32, std::array<int64_t, 2> nr23 = {1, 1}, int64_t kv = 96, int64_t nb = 8,
                         bool mask = true, bool sinks = false, float max_bias = 0.0f, float logit_softcap = 0.0f, ggml_prec prec = GGML_PREC_F32,
                         ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3},
-                        bool kv_view = true)
+                        int64_t n_tail = 0, bool tail_only = false, ggml_type type_tail_k = GGML_TYPE_F16,
+                        ggml_type type_tail_v = GGML_TYPE_COUNT, bool tail_interleaved = false,
+                        bool tail_all_masked = false, bool canonical_body = false,
+                        bool full_coverage_equivalence = false, bool split_equivalence = false,
+                        int64_t n_tail_current = 0, bool segmented_equivalence = false,
+                        float scale = 0.0f, int64_t n_tail_active = -1,
+                        int64_t n_tail_history_slots = 0)
         : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), sinks(sinks), max_bias(max_bias), logit_softcap(logit_softcap), prec(prec),
-          type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view) {}
+          type_K(type_K), type_V(type_V), permute(permute), n_tail(n_tail), tail_only(tail_only), type_tail_k(type_tail_k),
+          type_tail_v(type_tail_v == GGML_TYPE_COUNT ? type_tail_k : type_tail_v), tail_interleaved(tail_interleaved),
+          tail_all_masked(tail_all_masked), canonical_body(canonical_body),
+          full_coverage_equivalence(full_coverage_equivalence), split_equivalence(split_equivalence),
+          n_tail_current(n_tail_current), segmented_equivalence(segmented_equivalence), scale(scale),
+          n_tail_active(n_tail_active), n_tail_history_slots(n_tail_history_slots) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_K));
@@ -7134,7 +7144,7 @@ struct test_flash_attn_ext : public test_case {
         ggml_tensor * q = create_permuted(GGML_TYPE_F32, hsk_padded, nb, nh*nr23[0], nr23[1], false);
         ggml_set_name(q, "q");
 
-        ggml_tensor * k = create_permuted(type_K,        hsk_padded, kv, nh,         nr23[1], kv_view); // the K tensor is usually a view of the K cache
+        ggml_tensor * k = create_permuted(type_K,        hsk_padded, kv, nh,         nr23[1], true); // the K tensor is usually a view of the K cache
         ggml_set_name(k, "k");
 
         ggml_tensor * v = nullptr;
@@ -7148,7 +7158,7 @@ struct test_flash_attn_ext : public test_case {
             //   - https://github.com/ggml-org/llama.cpp/pull/18986
             v = ggml_view_4d(ctx, k, hsv_padded, kv, nh, nr23[1], k->nb[1], k->nb[2], k->nb[3], 0);
         } else {
-            v = create_permuted(type_V,        hsv_padded, kv, nh,         nr23[1], kv_view); // the V tensor is usually a view of the V cache
+            v = create_permuted(type_V,        hsv_padded, kv, nh,         nr23[1], true); // the V tensor is usually a view of the V cache
         }
         ggml_set_name(v, "v");
 
@@ -7164,9 +7174,136 @@ struct test_flash_attn_ext : public test_case {
             ggml_set_name(s, "s");
         }
 
-        ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf(hsk), max_bias, logit_softcap);
+        const float attn_scale = scale > 0.0f ? scale : 1.0f/sqrtf(hsk);
+        ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, attn_scale, max_bias, logit_softcap);
+        ggml_tensor * exact = nullptr;
+        if (n_tail > 0) {
+            const int64_t n_tail_used = n_tail_active >= 0 ? n_tail_active : n_tail;
+            GGML_ASSERT(!tail_interleaved || (nr23[1] == 1 && nb == 4));
+            GGML_ASSERT(n_tail_used >= 0 && n_tail_used <= n_tail);
+            GGML_ASSERT(n_tail_current >= 0 && n_tail_current <= n_tail_used);
+            GGML_ASSERT(!segmented_equivalence || (n_tail_current > 0 && !tail_interleaved && nr23[1] == 1));
+            const int64_t n_tail_history = n_tail_used - n_tail_current;
+            const int64_t history_slots = n_tail_history_slots > 0 ?
+                    n_tail_history_slots : n_tail_history;
+            const int64_t arena_stride = GGML_PAD(n_tail + nb, 256);
+            const int64_t attention_stride = n_tail;
+            const int64_t n_active = tail_interleaved ? 2 : nr23[1];
+            const int64_t q_max = tail_interleaved ? 2 : nb;
+            const int64_t n_arenas = tail_interleaved ? 3 : nr23[1];
+            const int64_t n_tail_slots = arena_stride*n_arenas;
+            ggml_tensor * kt_storage = ggml_new_tensor_4d(ctx, type_tail_k, hsk_padded, nh, n_tail_slots, 1);
+            ggml_tensor * vt_storage = ggml_new_tensor_4d(ctx, type_tail_v, hsv_padded, nh, n_tail_slots, 1);
+            ggml_tensor * kt = ggml_permute(ctx, kt_storage, 0, 2, 1, 3);
+            ggml_tensor * vt = ggml_permute(ctx, vt_storage, 0, 2, 1, 3);
+            ggml_tensor * mt = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, attention_stride, nb, 1, nr23[1]);
+            ggml_tensor * qo = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, q_max, n_active);
+            ggml_tensor * rd = ggml_new_tensor_2d(
+                    ctx, GGML_TYPE_I32,
+                    6 + attention_stride + (canonical_body ? arena_stride : 0), n_active);
+            ggml_set_name(kt, "kt");
+            ggml_set_name(vt, "vt");
+            ggml_set_name(mt, "mt");
+            ggml_set_name(qo, "qo");
+            ggml_set_name(rd, "rd");
+            ggml_tensor * kt_current = nullptr;
+            ggml_tensor * vt_current = nullptr;
+            if (n_tail_current > 0) {
+                kt_current = create_permuted(
+                        type_tail_k, hsk_padded, n_tail_current, nh, 1, false);
+                vt_current = create_permuted(
+                        type_tail_v, hsv_padded, n_tail_current, nh, 1, false);
+                ggml_set_name(kt_current, "kt_current");
+                ggml_set_name(vt_current, "vt_current");
+                out = ggml_kv_tail_attention_merge_segmented(
+                    ctx, out, kt, vt, kt_current, vt_current, mt, qo, rd);
+                if (segmented_equivalence) {
+                    // Match compact-cache execution: the persistent tensor may
+                    // expose padded scratch rows, while virtual current indices
+                    // start immediately after the logical N+R history.
+                    ggml_flash_attn_ext_set_kv_tail_history_slots(
+                            out, int32_t(history_slots));
+                }
+            } else {
+                out = ggml_kv_tail_attention_merge(ctx, out, kt, vt, mt, qo, rd);
+            }
+            if (tail_only) {
+                ggml_flash_attn_ext_set_kv_tail_bodyless(out);
+            }
+            if (full_coverage_equivalence) {
+                GGML_ASSERT(tail_only && n_tail == kv && !tail_interleaved && nr23[1] == 1);
+                ggml_tensor * exact_k = ggml_view_4d(
+                        ctx, kt, hsk_padded, n_tail, nh, 1,
+                        kt->nb[1], kt->nb[2], kt->nb[3], 0);
+                ggml_tensor * exact_v = ggml_view_4d(
+                        ctx, vt, hsv_padded, n_tail, nh, 1,
+                        vt->nb[1], vt->nb[2], vt->nb[3], 0);
+                exact = ggml_flash_attn_ext(ctx, q, exact_k, exact_v, mt, attn_scale, max_bias, logit_softcap);
+            } else if (split_equivalence) {
+                GGML_ASSERT(!tail_only && mask && !tail_interleaved && nr23[1] == 1);
+                GGML_ASSERT(type_K == type_tail_k && type_V == type_tail_v);
+                ggml_tensor * exact_k = ggml_view_4d(
+                        ctx, kt, hsk_padded, n_tail, nh, 1,
+                        kt->nb[1], kt->nb[2], kt->nb[3], 0);
+                ggml_tensor * exact_v = ggml_view_4d(
+                        ctx, vt, hsv_padded, n_tail, nh, 1,
+                        vt->nb[1], vt->nb[2], vt->nb[3], 0);
+                ggml_tensor * combined_k = ggml_concat(ctx, k, exact_k, 1);
+                ggml_tensor * combined_v = ggml_concat(ctx, v, exact_v, 1);
+                ggml_tensor * combined_m = ggml_concat(ctx, m, mt, 0);
+                exact = ggml_flash_attn_ext(
+                        ctx, q, combined_k, combined_v, combined_m,
+                        attn_scale, max_bias, logit_softcap);
+            } else if (segmented_equivalence) {
+                GGML_ASSERT(mask && nr23[1] == 1);
+                GGML_ASSERT(tail_only || (type_K == type_tail_k && type_V == type_tail_v));
+                ggml_tensor * combined_k = kt_current;
+                ggml_tensor * combined_v = vt_current;
+                if (n_tail_history > 0) {
+                    ggml_tensor * history_k = ggml_view_4d(
+                            ctx, kt, hsk_padded, n_tail_history, nh, 1,
+                            kt->nb[1], kt->nb[2], kt->nb[3], 0);
+                    ggml_tensor * history_v = ggml_view_4d(
+                            ctx, vt, hsv_padded, n_tail_history, nh, 1,
+                            vt->nb[1], vt->nb[2], vt->nb[3], 0);
+                    combined_k = ggml_concat(ctx, history_k, kt_current, 1);
+                    combined_v = ggml_concat(ctx, history_v, vt_current, 1);
+                }
+                ggml_tensor * combined_m = mt;
+                const int64_t padded_tail = GGML_PAD(n_tail, 256);
+                if (padded_tail > n_tail_used) {
+                    ggml_tensor * k_padding = ggml_new_tensor_4d(
+                            ctx, type_tail_k, hsk_padded, padded_tail - n_tail_used, nh, 1);
+                    ggml_tensor * v_padding = ggml_new_tensor_4d(
+                            ctx, type_tail_v, hsv_padded, padded_tail - n_tail_used, nh, 1);
+                    ggml_set_name(k_padding, "kt_padding");
+                    ggml_set_name(v_padding, "vt_padding");
+                    combined_k = ggml_concat(ctx, combined_k, k_padding, 1);
+                    combined_v = ggml_concat(ctx, combined_v, v_padding, 1);
+                }
+                if (padded_tail > n_tail) {
+                    ggml_tensor * mask_padding = ggml_new_tensor_4d(
+                            ctx, GGML_TYPE_F16, padded_tail - n_tail, nb, 1, 1);
+                    ggml_set_name(mask_padding, "mt_padding");
+                    combined_m = ggml_concat(ctx, mt, mask_padding, 0);
+                }
+                if (!tail_only) {
+                    combined_k = ggml_concat(ctx, k, combined_k, 1);
+                    combined_v = ggml_concat(ctx, v, combined_v, 1);
+                    combined_m = ggml_concat(ctx, m, combined_m, 0);
+                }
+                exact = ggml_flash_attn_ext(
+                        ctx, q, combined_k, combined_v, combined_m,
+                        attn_scale, max_bias, logit_softcap);
+            }
+        }
         ggml_flash_attn_ext_add_sinks(out, s);
         ggml_flash_attn_ext_set_prec (out, prec);
+        if (exact != nullptr) {
+            ggml_flash_attn_ext_add_sinks(exact, s);
+            ggml_flash_attn_ext_set_prec (exact, prec);
+            out = ggml_concat(ctx, out, exact, 3);
+        }
         ggml_set_name(out, "out");
 
         return out;
@@ -7178,7 +7315,78 @@ struct test_flash_attn_ext : public test_case {
                 // make the sink values more noticeable in order to trigger a test failure when the implementation is wrong
                 init_tensor_uniform(t, -10.0f, 10.0f);
             } else if (strcmp(t->name, "m") == 0) {
-                init_tensor_kq_mask(t);
+                if (tail_only) {
+                    std::vector<ggml_fp16_t> values(ggml_nelements(t), ggml_fp32_to_fp16(-INFINITY));
+                    ggml_backend_tensor_set(t, values.data(), 0, values.size()*sizeof(values[0]));
+                } else {
+                    init_tensor_kq_mask(t);
+                }
+            } else if (strcmp(t->name, "mt") == 0) {
+                std::vector<ggml_fp16_t> values(ggml_nelements(t));
+                const int64_t n_tail_used = n_tail_active >= 0 ? n_tail_active : n_tail;
+                const int64_t n_tail_history = n_tail_used - n_tail_current;
+                for (int64_t is = 0; is < t->ne[3]; ++is) {
+                    for (int64_t iq = 0; iq < t->ne[1]; ++iq) {
+                        for (int64_t token = 0; token < t->ne[0]; ++token) {
+                            values[(is*t->ne[1] + iq)*t->ne[0] + token] = ggml_fp32_to_fp16(
+                                !tail_all_masked && token < n_tail_used &&
+                            (n_tail_current > 0 ? token < n_tail_history + iq + 1 : token <= iq) ?
+                                    0.0f : -INFINITY);
+                        }
+                    }
+                }
+                ggml_backend_tensor_set(t, values.data(), 0, values.size()*sizeof(values[0]));
+            } else if (strcmp(t->name, "mt_padding") == 0) {
+                std::vector<ggml_fp16_t> values(
+                        ggml_nelements(t), ggml_fp32_to_fp16(-INFINITY));
+                ggml_backend_tensor_set(t, values.data(), 0, values.size()*sizeof(values[0]));
+            } else if (strcmp(t->name, "kt_padding") == 0 || strcmp(t->name, "vt_padding") == 0) {
+                std::vector<uint8_t> values(ggml_nbytes(t), 0);
+                ggml_backend_tensor_set(t, values.data(), 0, values.size());
+            } else if (strcmp(t->name, "qo") == 0) {
+                std::vector<int32_t> values(ggml_nelements(t));
+                if (tail_interleaved) {
+                    values = { 0, 2, 1, 3 };
+                } else {
+                    for (int64_t is = 0; is < t->ne[1]; ++is) {
+                        for (int64_t query = 0; query < t->ne[0]; ++query) {
+                            values[is*t->ne[0] + query] = int32_t(is*nb + query);
+                        }
+                    }
+                }
+                ggml_backend_tensor_set(t, values.data(), 0, values.size()*sizeof(values[0]));
+            } else if (strcmp(t->name, "rd") == 0) {
+                std::vector<int32_t> values(ggml_nelements(t), -1);
+                for (int64_t is = 0; is < t->ne[1]; ++is) {
+                    int32_t * desc = values.data() + t->ne[0]*is;
+                    desc[0] = int32_t(tail_interleaved ? 2*is : is);
+                    desc[1] = int32_t(is*(tail_interleaved ? 2 : nb));
+                    desc[2] = int32_t(tail_interleaved ? 2 : nb);
+                    desc[3] = int32_t(tail_interleaved ? 1 : t->ne[1] - is);
+                    const int64_t n_tail_used = n_tail_active >= 0 ? n_tail_active : n_tail;
+                    const int64_t n_tail_history = n_tail_used - n_tail_current;
+                    const int64_t history_slots = n_tail_history_slots > 0 ?
+                            n_tail_history_slots : n_tail_history;
+                    desc[4] = int32_t(n_tail_used);
+                    desc[5] = canonical_body ? int32_t(kv) : -1;
+                    const int64_t attention_stride = n_tail;
+                    const int64_t arena_stride = GGML_PAD(n_tail + nb, 256);
+                    const int64_t n_arenas = tail_interleaved ? 3 : nr23[1];
+                    const int64_t n_tail_slots = arena_stride*n_arenas;
+                    const int64_t physical_arena = tail_interleaved ? 2*is : is;
+                    for (int64_t token = 0; token < n_tail_used; ++token) {
+                        desc[6 + token] = n_tail_current > 0 && token >= n_tail_history ?
+                            int32_t((segmented_equivalence ? history_slots : n_tail_slots) +
+                                    token - n_tail_history) :
+                            int32_t(physical_arena*arena_stride + token);
+                    }
+                    if (canonical_body) {
+                        for (int64_t token = 0; token < kv; ++token) {
+                            desc[6 + attention_stride + token] = int32_t(is*kv + token);
+                        }
+                    }
+                }
+                ggml_backend_tensor_set(t, values.data(), 0, values.size()*sizeof(values[0]));
             } else {
                 init_tensor_uniform(t);
             }
@@ -7782,8 +7990,7 @@ struct test_generic_op : public test_case {
     void initialize_tensors(ggml_context * ctx) override {
         ggml_tensor * out = ggml_get_tensor(ctx, "out");
 
-        std::random_device rd;
-        std::default_random_engine rng(rd());
+        auto rng = make_test_rng();
 
         for (size_t i = 0; i < sources.size() && i < GGML_MAX_SRC; i++) {
             ggml_tensor * t = out->src[i];
@@ -7976,7 +8183,7 @@ public:
                 // pos
                 std::vector<int> data(hp.n_tokens);
                 for (int i = 0; i < hp.n_tokens; i++) {
-                    data[i] = rand() % hp.n_ctx;
+                    data[i] = test_random_u32() % hp.n_ctx;
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, hp.n_tokens * sizeof(int));
             } else {
@@ -8252,8 +8459,7 @@ static const ggml_type all_types[] = {
     GGML_TYPE_Q2_K, GGML_TYPE_Q3_K,
     GGML_TYPE_Q4_K, GGML_TYPE_Q5_K,
     GGML_TYPE_Q6_K,
-    GGML_TYPE_TQ2_0,
-    // GGML_TYPE_TQ1_0, // TODO: implement for all backends
+    // GGML_TYPE_TQ1_0, GGML_TYPE_TQ2_0, // TODO: implement for all backends
     GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S,
     GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M,
     GGML_TYPE_IQ4_NL, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS,
@@ -8280,8 +8486,7 @@ static const ggml_type other_types[] = {
     GGML_TYPE_Q2_K, GGML_TYPE_Q3_K,
     GGML_TYPE_Q5_K,
     GGML_TYPE_Q6_K,
-    GGML_TYPE_TQ2_0,
-    // GGML_TYPE_TQ1_0, // TODO: implement for all backends
+    // GGML_TYPE_TQ1_0, GGML_TYPE_TQ2_0, // TODO: implement for all backends
     GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S,
     GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M,
     GGML_TYPE_IQ4_NL, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS,
@@ -8296,6 +8501,7 @@ static const ggml_type other_types[] = {
 // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    const auto & standard_cache_types = common_kv_cache_types();
     std::default_random_engine rng(0);
 
     // unary ops
@@ -8315,25 +8521,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
         test_cases.emplace_back(new test_relu_sqr(type, { 128, 2, 2, 2 }));
         test_cases.emplace_back(new test_relu_sqr(type, { 5, 7, 11, 13 }));
-    }
-
-    // fused unary + mul (gated activations that are not expressed as GGML_OP_GLU)
-    for (ggml_unary_op op : { GGML_UNARY_OP_SILU, GGML_UNARY_OP_SIGMOID, GGML_UNARY_OP_SOFTPLUS }) {
-        for (ggml_type type : { GGML_TYPE_F16, GGML_TYPE_F32 }) {
-            for (bool swap : { false, true }) {
-                test_cases.emplace_back(new test_unary_mul(op, type, { 128, 2, 2, 2 }, swap));
-            }
-            test_cases.emplace_back(new test_unary_mul(op, type, { 5, 7, 11, 13 }));
-            test_cases.emplace_back(new test_unary_mul(op, type, { 128, 2, 2, 2 }, false, "pad_unary"));
-            // a view only stays out from between the two ops when the unary result is second
-            test_cases.emplace_back(new test_unary_mul(op, type, { 128, 2, 2, 2 }, true, "pad_other"));
-            test_cases.emplace_back(new test_unary_mul(op, type, { 128, 2, 2, 2 }, true, "halves"));
-            test_cases.emplace_back(new test_unary_mul(op, type, { 128, 2, 2, 2 }, false, "packed", "consumer"));
-            // must not fuse
-            test_cases.emplace_back(new test_unary_mul(op, type, { 128, 2, 2, 2 }, false, "strided_dim1"));
-            test_cases.emplace_back(new test_unary_mul(op, type, { 128, 2, 2, 2 }, false, "bcast"));
-            test_cases.emplace_back(new test_unary_mul(op, type, { 128, 2, 2, 2 }, false, "packed", "reuse"));
-        }
     }
 
     // SNAKE activation fusion: x + sin(a*x)^2 * inv_b
@@ -8397,6 +8584,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_get_rows(type,     256,   80000, 70000,   2,   1, false));
         test_cases.emplace_back(new test_get_rows(type,     256,   5,         4, 700, 100, false));
     }
+    for (ggml_type type : standard_cache_types) {
+        if (std::find(std::begin(all_types), std::end(all_types), type) == std::end(all_types)) {
+            test_cases.emplace_back(new test_get_rows(type, 256, 5, 4, 1, 1, false));
+        }
+    }
 
     test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 1, 8, 2, 1, 1, false));
     for (ggml_type type : all_types) {
@@ -8427,6 +8619,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_I32, { 1, 8, 1, 3 }, { 1, 1 }, 2, false));
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_Q8_0, GGML_TYPE_I32, { 256, 5, 1, 3 }, { 1, 1, }, 1, false));
     for (ggml_type src_type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
+        for (ggml_type type : standard_cache_types) {
+            if (std::find(std::begin(all_types), std::end(all_types), type) == std::end(all_types)) {
+                test_cases.emplace_back(new test_set_rows(src_type, type, GGML_TYPE_I32, { 256, 5, 1, 3 }, { 1, 1 }, 1, false));
+                for (int b : {1, 7}) {
+                    for (bool v : {false, true}) {
+                        test_cases.emplace_back(new test_set_rows(src_type, type, GGML_TYPE_I64, { 256, 5, b, 3 }, { 1, 1 }, 1, v));
+                        test_cases.emplace_back(new test_set_rows(src_type, type, GGML_TYPE_I64, { 256, 11, 1, b }, { 2, 3 }, 7, v));
+                        test_cases.emplace_back(new test_set_rows(src_type, type, GGML_TYPE_I64, { 3*ggml_blck_size(type), 3, b, 1 }, { 2, 3 }, 2, v));
+                    }
+                }
+            }
+        }
         for (ggml_type type : all_types) {
             for (int b : {1, 7}) {
                 for (bool v : {false, true}) {
@@ -8447,6 +8651,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F16, GGML_TYPE_F16, GGML_TYPE_I32, { 1, 8, 1, 3 }, { 1, 1 }, 2, false));
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F16, GGML_TYPE_F16, GGML_TYPE_I64, { 1, 8, 1, 3 }, { 1, 1 }, 2, true));
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F16, GGML_TYPE_F16, GGML_TYPE_I32, { 1, 8, 1, 3 }, { 1, 1 }, 2, true));
+    test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_I64, { 32, 8, 1, 1 }, { 1, 1 }, 4, false, true));
+    test_cases.emplace_back(new test_set_rows(GGML_TYPE_F16, GGML_TYPE_F16, GGML_TYPE_I32, { 32, 8, 1, 1 }, { 1, 1 }, 4, false, true));
+    test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_I64, { 32, 8, 1, 1 }, { 1, 1 }, 4, false, true, true));
+    test_cases.emplace_back(new test_set_rows(GGML_TYPE_F16, GGML_TYPE_F16, GGML_TYPE_I32, { 32, 8, 1, 1 }, { 1, 1 }, 4, false, true, true));
+    test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_I64, { 128, 8, 1, 1 }, { 1, 1 }, 4, false, true, true));
+    test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_BF16, GGML_TYPE_I64, { 128, 8, 1, 1 }, { 1, 1 }, 4, false, true, true));
+    for (ggml_type body_type : standard_cache_types) {
+        if (!ggml_is_quantized(body_type)) {
+            continue;
+        }
+        for (ggml_type shadow_type : { GGML_TYPE_F16, GGML_TYPE_BF16 }) {
+            test_cases.emplace_back(new test_get_rows(body_type, 256, 11, 3, 1, 1, false, shadow_type));
+            test_cases.emplace_back(new test_set_rows_with_shadow(body_type, shadow_type));
+        }
+    }
+    test_cases.emplace_back(new test_set_rows_with_shadow(GGML_TYPE_Q4_0, GGML_TYPE_F16, true));
 
     for (int mode : { GGML_ROPE_TYPE_NORMAL, GGML_ROPE_TYPE_NEOX, GGML_ROPE_TYPE_MROPE, GGML_ROPE_TYPE_VISION }) {
         for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
@@ -8923,20 +9143,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    for (ggml_type type_dst : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
-        for (std::array<int64_t, 4> ne : std::initializer_list<std::array<int64_t, 4>>{
-                {10, 10, 10, 1}, {33, 5, 7, 1}, {64, 3, 65, 1}, {2, 3, 5, 7},
-                // large, tile-aligned and tile-unaligned, matching the perf cases
-                {1024, 64, 64, 1}, {2304, 64, 64, 1}, {1000, 33, 65, 1} }) {
-            for (std::array<int64_t, 4> perm : std::initializer_list<std::array<int64_t, 4>>{
-                    {2, 1, 0, 3},   // 0<->2 swap
-                    {1, 2, 0, 3},   // 3-cycle
-                    {0, 2, 1, 3} }) {
-                test_cases.emplace_back(new test_cont(type_dst, ne, false, perm));
-            }
-        }
-    }
-
     auto add_test_bin_bcast = [&](ggml_type type, std::array<int64_t, 4> ne, std::array<int, 4> nr, bool perm1 = false, bool src_overlap = false) {
         for (auto op : {ggml_add, ggml_sub, ggml_mul, ggml_div}) {
             test_cases.emplace_back(new test_bin_bcast(op, type, ne, nr, 1, perm1, src_overlap));
@@ -9107,9 +9313,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 80, 128, 1, 256, 1)); // Nemotron-9B SSD path
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 80, 128, 1, 512, 1)); // Nemotron-9B SSD multi-chunk (2 aligned chunks)
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 80, 8, 300, 2)); // Mamba-2 SSD multi-chunk (partial 2nd chunk, 2 seqs)
-    test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 16, 2, 4, 2, false, /*K=*/4)); // Mamba-2 rollback snapshots
-    test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 16, 2, 8, 2, false, /*K=*/3)); // Mamba-2 rollback overflow
-    test_cases.emplace_back(new test_ssm_scan_rollback(GGML_TYPE_F32, 128, 64, 16, 2, 8, 2, /*K=*/3)); // rollback snapshots match prefix states
 
     test_cases.emplace_back(new test_rwkv_wkv6(GGML_TYPE_F32, 32, 64, 1, 1));
     test_cases.emplace_back(new test_rwkv_wkv6(GGML_TYPE_F32, 32, 64, 32, 1));
@@ -9117,7 +9320,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_rwkv_wkv6(GGML_TYPE_F32, 32, 64, 128, 4));
 
     test_cases.emplace_back(new test_rwkv_wkv7(GGML_TYPE_F32, 32, 64, 1, 1));
-    test_cases.emplace_back(new test_rwkv_wkv7(GGML_TYPE_F32, 32, 64, 1, 4));
     test_cases.emplace_back(new test_rwkv_wkv7(GGML_TYPE_F32, 32, 64, 32, 1));
     test_cases.emplace_back(new test_rwkv_wkv7(GGML_TYPE_F32, 32, 64, 32, 4));
     test_cases.emplace_back(new test_rwkv_wkv7(GGML_TYPE_F32, 32, 64, 128, 4));
@@ -9153,13 +9355,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     for (ggml_type type_a : all_types) {
         for (int i = 1; i < 10; ++i) {
-            test_cases.emplace_back(new test_mul_mat(type_a,    GGML_TYPE_F32, 16,  i, 1*256, { 1,  1}, {1, 1}));
-            //test_cases.emplace_back(new test_mul_mat(type_a,    GGML_TYPE_F32, 12,  i, 2*256, { 2,  1}, {1, 1}));
-            //test_cases.emplace_back(new test_mul_mat(type_a,    GGML_TYPE_F32, 11,  i, 3*256, { 1,  3}, {5, 1}));
-            //test_cases.emplace_back(new test_mul_mat(type_a,    GGML_TYPE_F32, 13,  i, 4*256, { 2,  3}, {1, 1}));
-            //test_cases.emplace_back(new test_mul_mat(type_a,    GGML_TYPE_F32, 17,  i, 31*256, { 4,  1}, {1, 1}));
-            //test_cases.emplace_back(new test_mul_mat(type_a,    GGML_TYPE_F32, 18,  i, 32*256, { 1,  1}, {8, 1}));
-            //test_cases.emplace_back(new test_mul_mat(type_a,    GGML_TYPE_F32, 19,  i, 33*256, { 1,  1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type_a,    GGML_TYPE_F32, 16,  i, 256, { 1,  1}, {1, 1}));
         }
     }
 
@@ -9286,9 +9482,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 128, 45,  64, { 8,  1}, {4, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 1056, 1, 193, {1,  1}, {4, 1}, {0, 2, 1, 3}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 1056, 1, 67,  {1,  1}, {4, 1}, {0, 2, 1, 3}));
+    // RHS-only row padding must not select MMVF/MMF kernels whose float2 loads require stricter alignment.
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 128, 1, 256, {1, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, 257));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 128, 8, 256, {1, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, 257));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 128, 8, 256, {1, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, 258));
+    test_cases.emplace_back(new test_mul_mat(
+        GGML_TYPE_F16, GGML_TYPE_F32, 128, 1, 256,
+        {1, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, 260, sizeof(float)));
+    test_cases.emplace_back(new test_mul_mat(
+        GGML_TYPE_F16, GGML_TYPE_F32, 128, 8, 256,
+        {1, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, 260, sizeof(float)));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 16, 32, 32, { 1,  1}, {1, 1}, {0, 1, 2, 3}, 64, 3));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 64, 77, 77, {12,1}, {1,1}));
-    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 32, 4, 96, {3, 2}, {1, 1}, {0, 1, 2, 3}, 0, 1, true));
 
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 576, 512, 576, {1,1}, {1,1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 1, 2048, 8192, {1,  1}, {1, 1}));
@@ -9309,8 +9514,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 64, 128, k, {12,1}, {1,1}));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 16, 16, false, 50, 200, k));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 16, 16, true, 50, 200, k));
-        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_BF16, GGML_TYPE_F32, 16, 16, false, 50, 200, k));
-        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_BF16, GGML_TYPE_F32, 16, 16, true, 50, 200, k));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F32, GGML_TYPE_F32, 16, 16, false, 50, 200, k));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F32, GGML_TYPE_F32, 16, 16, true, 50, 200, k));
     }
@@ -9342,11 +9545,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 16, 16, b, 32, 1024, 16));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 2, 2, b, 32, 8192, 64));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 16, 16, b, 50, 200, 64));
-        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_BF16, GGML_TYPE_F32, 16, 16, b, 32, 1024, 16));
-        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_BF16, GGML_TYPE_F32, 16, 16, b, 50, 200, 64));
     }
 
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 1, 1, false, 8, 16, 1));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 8, 2, false, 128, 8, 256, 257));
+    test_cases.emplace_back(new test_mul_mat_id(
+        GGML_TYPE_F16, GGML_TYPE_F32, 8, 2, false, 128, 8, 256, 260, sizeof(float)));
     test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_F16, GGML_TYPE_F32, 16, 16, false, 32, 32, 32, 3));
 
     // gpt-oss issue with Vulkan mmq_id
@@ -9414,6 +9618,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 }
             }
         }
+    }
+
+    // Standard quantized KV values use OUT_PROD in tiered body/tail attention.
+    // Keep this inventory aligned with the cache CLI, including Bee low-bit types.
+    for (ggml_type type_a : standard_cache_types) {
+        if (!ggml_is_quantized(type_a)) {
+            continue;
+        }
+        test_cases.emplace_back(new test_out_prod(type_a, GGML_TYPE_F32, 128, 1, 64, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_out_prod(type_a, GGML_TYPE_F32, 128, 16, 64, {2, 1}, {2, 1}));
     }
 
     // ne2 sweep to cover the cublasSgemmStridedBatched path (dps2 == 1, ne2 > 1)
@@ -9631,19 +9845,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    // rotated dims window at an offset (ggml_rope_set_offset), not supported for vision mode
-    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16}) {
-        for (bool fw : {true, false}) { // fw == forward
-            for (bool ff : {false, true}) {
-                test_cases.emplace_back(new test_rope(type, {128, 32, 2, 1}, 32, GGML_ROPE_TYPE_NORMAL, 512, 1.4245f, 0.7465f, 1.4245f, ff, 0, fw, false, 32));
-                test_cases.emplace_back(new test_rope(type, {128, 32, 2, 1}, 32, GGML_ROPE_TYPE_NEOX,   512, 1.4245f, 0.7465f, 1.4245f, ff, 0, fw, false, 32));
-                test_cases.emplace_back(new test_rope(type, {128, 12, 2, 1}, 24, GGML_ROPE_TYPE_MROPE,  512, 1.4245f, 0.7465f, 1.4245f, ff, 0, fw, false, 32));
-                test_cases.emplace_back(new test_rope(type, {128, 12, 2, 1}, 24, GGML_ROPE_TYPE_IMROPE, 512, 1.4245f, 0.7465f, 1.4245f, ff, 0, fw, false, 32));
-            }
-        }
-        // inplace with an offset
-        test_cases.emplace_back(new test_rope(type, {128, 32, 2, 1}, 32, GGML_ROPE_TYPE_NEOX, 512, 1.4245f, 0.7465f, 1.4245f, false, 0, true, true, 32));
-    }
+    // Standard-cache exact BF16 tails are rotated in place during KV shifts.
+    // Keep focused forward/backward coverage here because test-rope is not
+    // available in GGML_BACKEND_DL builds.
+    test_cases.emplace_back(new test_rope(
+        GGML_TYPE_BF16, {128, 4, 3, 1}, 128, GGML_ROPE_TYPE_NORMAL,
+        512, 1.0f, 0.0f, 1.0f, false, 0, true, true));
+    test_cases.emplace_back(new test_rope(
+        GGML_TYPE_BF16, {128, 4, 3, 1}, 128, GGML_ROPE_TYPE_NORMAL,
+        512, 1.0f, 0.0f, 1.0f, false, 0, false, false));
 
     for (int v : { 0, 1, 2, 3 }) {
         for (int dim : { 0, 1, 2, 3, }) {
@@ -9782,7 +9992,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_pad_reflect_1d());
     test_cases.emplace_back(new test_pad_reflect_1d(GGML_TYPE_F32, {3000, 384, 4, 1}));
     test_cases.emplace_back(new test_roll());
-    test_cases.emplace_back(new test_roll(3, -2, 1, -1, true));
     test_cases.emplace_back(new test_arange());
     test_cases.emplace_back(new test_arange(GGML_TYPE_F32, 0.0f, 1048576.0f, 1.0f));
     test_cases.emplace_back(new test_timestep_embedding());
@@ -9929,6 +10138,189 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(128, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q1_0, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 128, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q1_0));
     test_cases.emplace_back(new test_flash_attn_ext(128, 64, 4, {1, 1}, 64, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q1_0, GGML_TYPE_F16));
+    // Query-specific exact tails: isolate the tail partial, then exercise the
+    // FP32 global-softmax merge with a quantized body partial.
+    test_cases.emplace_back(new test_flash_attn_ext(64, 64, 2, {2, 1}, 256, 2, true, false, 0, 0,
+        GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, 4, true, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext(64, 64, 2, {2, 1}, 256, 2, true, false, 0, 0,
+        GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, 4, false, GGML_TYPE_BF16));
+    // Bee standard low-bit KV families: cover every new body type in an
+    // attached-tail CUDA descriptor. Symmetric rows exercise the native route;
+    // the ordered family pairs are the operand shapes used by the capability
+    // test's forced-generic (explicit-bias) route.
+    const std::pair<ggml_type, int64_t> low_bit_native[] = {
+        { GGML_TYPE_Q2_0S, 16 }, { GGML_TYPE_Q2_1,  32 },
+        { GGML_TYPE_Q3_0,  64 }, { GGML_TYPE_Q3_1, 128 },
+        { GGML_TYPE_Q6_0,  16 }, { GGML_TYPE_Q6_1,  32 },
+    };
+    for (const auto & [body_type, n_tail] : low_bit_native) {
+        test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {2, 1}, 256, 2, true, false, 0, 0,
+            GGML_PREC_F32, body_type, body_type, {0, 1, 2, 3}, n_tail, false, GGML_TYPE_F16));
+    }
+    for (const auto & body_types : {
+            std::pair{ GGML_TYPE_Q2_0S, GGML_TYPE_Q2_1 },
+            std::pair{ GGML_TYPE_Q3_0,  GGML_TYPE_Q3_1 },
+            std::pair{ GGML_TYPE_Q6_0,  GGML_TYPE_Q6_1 } }) {
+        test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {2, 1}, 256, 2, true, false, 0, 0,
+            GGML_PREC_F32, body_types.first, body_types.second, {0, 1, 2, 3}, 64, false, GGML_TYPE_BF16));
+    }
+    // Qwen3.6 geometry: 24 query heads over 4 KV heads with 256-wide K/V.
+    // Cover both the smallest tail and a full query-specific prefill tail.
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 256, 2, true, false, 0, 0,
+        GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, 1, false, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 256, 2, true, false, 0, 0,
+        GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, 128, true, GGML_TYPE_BF16));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 256, 2, true, false, 0, 0,
+        GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, 128, false, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 256, 64, true, false, 0, 0,
+        GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, 64, false, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 256, 512, true, false, 0, 0,
+        GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, 1, false, GGML_TYPE_BF16));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 256, 64, true, false, 0, 0,
+        GGML_PREC_F32, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_NL, {0, 1, 2, 3}, 64, false, GGML_TYPE_BF16));
+    // Long quantized body forces the MMA stream-K completion/fixup route to
+    // publish its final max and denominator before the exact-tail merge.
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4096, 2, true, false, 0, 0,
+        GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, 64, false, GGML_TYPE_F16));
+    // Gemma 4 geometry: D512 needs the indexed-small exact-tail kernel for a
+    // 128-token tail because the generic D512 FA route requires KV padding to 256.
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 4, {8, 1}, 4096, 1, true, false, 0, 0,
+        GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, 128, false, GGML_TYPE_F16));
+    // Mixed Gemma global layers retain a quantized D512 body, pack its body
+    // map to the 256-row CUDA FA execution stride, and attach graph-local
+    // current K/V.  Cover decode and a multi-query cohort; both must be
+    // supported and numerically agree with the CPU composite oracle.
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 4, {8, 1}, 256, 1, true, false, 0, 0,
+        GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, 33, false,
+        GGML_TYPE_F16, GGML_TYPE_F16, false, false, true, false, false, 1, false));
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 4, {8, 1}, 256, 8, true, false, 0, 0,
+        GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, 40, false,
+        GGML_TYPE_F16, GGML_TYPE_F16, false, false, true, false, false, 8, false));
+    // Exact-tail composite contract: every ordered F16/BF16 K/V pair.
+    for (const auto tail_types : {
+            std::pair{ GGML_TYPE_F16,  GGML_TYPE_F16  },
+            std::pair{ GGML_TYPE_BF16, GGML_TYPE_BF16 },
+            std::pair{ GGML_TYPE_F16,  GGML_TYPE_BF16 },
+            std::pair{ GGML_TYPE_BF16, GGML_TYPE_F16  } }) {
+        test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {2, 1}, 256, 4, true, false, 0, 0,
+            GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, 32, false,
+            tail_types.first, tail_types.second));
+    }
+    // One-sided body storage uses an aligned same-type shadow for the exact side.
+    test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {2, 1}, 256, 4, true, false, 0, 0,
+        GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_F16, {0, 1, 2, 3}, 32, false,
+        GGML_TYPE_BF16, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {2, 1}, 256, 4, true, false, 0, 0,
+        GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, {0, 1, 2, 3}, 32, false,
+        GGML_TYPE_F16, GGML_TYPE_BF16));
+    // Merge modifiers and sanitization.
+    test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {2, 1}, 256, 1, true, false, 0, 0,
+        GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, 16, false, GGML_TYPE_BF16));
+    test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {2, 1}, 256, 4, true, true, 0, 0,
+        GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, 16, false, GGML_TYPE_BF16));
+    test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {2, 1}, 256, 4, true, false, 8.0f, 0,
+        GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, 16, false, GGML_TYPE_BF16));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {2, 1}, 256, 4, true, false, 0, 10.0f,
+        GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, 16, false, GGML_TYPE_BF16));
+    test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {2, 1}, 256, 4, true, false, 0, 0,
+        GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, 16, false,
+        GGML_TYPE_BF16, GGML_TYPE_BF16, false, true));
+    // Batched arena packing and a unified caller order {seq0,seq2,seq0,seq2}.
+    test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {2, 3}, 256, 2, true, false, 0, 0,
+        GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, 16, false, GGML_TYPE_BF16));
+    test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {2, 1}, 256, 4, true, false, 0, 0,
+        GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, 16, false,
+        GGML_TYPE_BF16, GGML_TYPE_F16, true));
+    // A sparse quantized body is packed in logical sequence order before the
+    // two-FA merge so unified and split physical cache layouts use one route.
+    test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {2, 2}, 128, 4, true, false, 0, 0,
+        GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, 16, false,
+        GGML_TYPE_BF16, GGML_TYPE_F16, false, false, true));
+    // A fully covering overlay must equal the same exact K/V presented as an
+    // ordinary body. The custom error metric checks this invariant separately
+    // on both the tested backend and the CPU oracle.
+    test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {2, 1}, 32, 4, true, false, 0.0f, 0.0f,
+        GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, 32, true,
+        GGML_TYPE_F16, GGML_TYPE_F16, false, false, false, true));
+    // Native compact decode keeps the persistent N-token history and the
+    // graph-local U-token current segment separate. The CUDA operator must
+    // produce the same single-softmax result as one ordinary FA over N + U.
+    test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {2, 1}, 132, 4, true, false, 0.0f, 0.0f,
+        GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, 132, true,
+        GGML_TYPE_F16, GGML_TYPE_F16, false, false, false, false, false, 4, true));
+    // A full-window Gemma decode is bodyless even when its effective context
+    // is only 256 tokens. This is the latency-critical direct indexed route.
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 4, {8, 1}, 256, 1, true, false, 0.0f, 0.0f,
+        GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, 256, true,
+        GGML_TYPE_F16, GGML_TYPE_F16, false, false, false, false, false, 1, true));
+    // The masked body anchor must use the same BF16 type as the exact source;
+    // requiring a fictitious F16/BF16 pair rejects the standard Q4 full-SWA
+    // representation even though the body contributes no rows.
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 4, {8, 1}, 256, 1, true, false, 0.0f, 0.0f,
+        GGML_PREC_F32, GGML_TYPE_BF16, GGML_TYPE_BF16, {0, 1, 2, 3}, 33, true,
+        GGML_TYPE_BF16, GGML_TYPE_BF16, false, false, false, false, false, 1, true));
+    // Gemma-style D512 attention can have an unaligned compact N+U source
+    // (1024 persistent rows plus a 100-token current ubatch). CUDA pads only
+    // the graph-local FA workspace; the segmented source itself remains 1124
+    // rows and must match an explicitly padded one-pass exact reference.
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 4, {8, 1}, 1280, 100, true, false, 0.0f, 0.0f,
+        GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, 1124, true,
+        GGML_TYPE_F16, GGML_TYPE_F16, false, false, false, false, false, 100, true));
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 4, {8, 1}, 1280, 100, true, false, 0.0f, 0.0f,
+        GGML_PREC_F32, GGML_TYPE_BF16, GGML_TYPE_BF16, {0, 1, 2, 3}, 1124, true,
+        GGML_TYPE_BF16, GGML_TYPE_BF16, false, false, false, false, false, 100, true));
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 4, {8, 1}, 2048, 512, true, false, 0.0f, 0.0f,
+        GGML_PREC_F32, GGML_TYPE_BF16, GGML_TYPE_BF16, {0, 1, 2, 3}, 1536, true,
+        GGML_TYPE_BF16, GGML_TYPE_BF16, false, false, false, false, false, 512, true));
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 4, {8, 1}, 2048, 512, true, false, 0.0f, 0.0f,
+        GGML_PREC_F32, GGML_TYPE_BF16, GGML_TYPE_BF16, {0, 2, 1, 3}, 1536, true,
+        GGML_TYPE_BF16, GGML_TYPE_BF16, false, false, false, false, false, 512, true));
+    // Gemma 4 SWA layers use D256 with 32 query heads over 16 KV heads.  A
+    // full-window native-exact prefill keeps 1024 persistent rows and presents
+    // the current 512 rows as a graph-local segment.
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 16, {2, 1}, 2048, 512, true, false, 0.0f, 0.0f,
+        GGML_PREC_F32, GGML_TYPE_BF16, GGML_TYPE_BF16, {0, 1, 2, 3}, 1536, true,
+        GGML_TYPE_BF16, GGML_TYPE_BF16, false, false, false, false, false, 512, true));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 16, {2, 1}, 2048, 512, true, false, 0.0f, 0.0f,
+        GGML_PREC_F32, GGML_TYPE_BF16, GGML_TYPE_BF16, {0, 2, 1, 3}, 1536, true,
+        GGML_TYPE_BF16, GGML_TYPE_BF16, false, false, false, false, false, 512, true, 1.0f));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 16, {2, 1}, 1024, 512, true, false, 0.0f, 0.0f,
+        GGML_PREC_F32, GGML_TYPE_BF16, GGML_TYPE_BF16, {0, 2, 1, 3}, 1024, true,
+        GGML_TYPE_BF16, GGML_TYPE_BF16, false, false, false, false, false, 512, true,
+        1.0f, 512, 513));
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 4, {8, 1}, 1280, 1, true, false, 0.0f, 0.0f,
+        GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, 1025, true,
+        GGML_TYPE_F16, GGML_TYPE_F16, false, false, false, false, false, 1, true));
+    // A single-stream bodyless prefill with an already aligned union can feed
+    // its original Q/mask and final output directly through ordinary FA.
+    test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {2, 1}, 256, 16, true, false, 0.0f, 0.0f,
+        GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, 256, true,
+        GGML_TYPE_F16, GGML_TYPE_F16, false, false, false, false, false, 16, true));
+    // The same aligned single-stream inputs can be consumed directly when a
+    // packed quantized body still requires a separate partial and merge.
+    test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {2, 1}, 256, 16, true, false, 0.0f, 0.0f,
+        GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, 256, false,
+        GGML_TYPE_F16, GGML_TYPE_F16, false, false, true, false, false, 16, true));
+    // Serving-size exact-tail reductions. With a 512-token ubatch, configured
+    // tails of 1024 and 2048 use union strides of 1536 and 2560 respectively.
+    // A fully covering overlay must still equal one ordinary exact FA pass at
+    // both reduction geometries.
+    for (int64_t tail_stride : { 1536, 2560 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(64, 64, 1, {1, 1}, tail_stride, 512,
+            true, false, 0.0f, 0.0f, GGML_PREC_F32,
+            GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, tail_stride, true,
+            GGML_TYPE_F16, GGML_TYPE_F16, false, false, false, true));
+        test_cases.emplace_back(new test_flash_attn_ext(64, 64, 1, {1, 1}, 4096, 512,
+            true, false, 0.0f, 0.0f, GGML_PREC_F32,
+            GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, tail_stride, false,
+            GGML_TYPE_F16, GGML_TYPE_F16, false, false, false, false, true));
+    }
+    for (int hs : { 80, 96, 112 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 4, {2, 1}, 256, 2, true, false, 0, 0,
+            GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, 16, false, GGML_TYPE_BF16));
+    }
+    // Upstream serialized Q2_0 (group size 64) remains distinct from Bee's
+    // cache-facing Q2_0S (group size 32) exercised above.
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 96, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q2_0, GGML_TYPE_Q2_0));
     test_cases.emplace_back(new test_flash_attn_ext(128, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q2_0, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 128, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q2_0));
@@ -9942,12 +10334,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, kv, 512, true, false, 0, 0,
                                                         GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     }
-
-    // dense-allocated (non-view) quant K/V at batch >= 64, in cache and native layouts
-    test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 512, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false));
-    test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {4, 1}, 512, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false));
-    test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 1024, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false));
-    test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 512, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, false));
 
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));
@@ -9983,13 +10369,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                     use_id, 16, 8, b, with_bias, with_gate, with_lane_scale));
                                 test_cases.emplace_back(new test_mul_mat_vec_fusion(type, glu_op, 1, 32, 256,
                                     use_id, 16, 8, b, with_bias, with_gate, with_lane_scale, {1, 1}));
-                                if (!use_id && with_gate && !with_bias) {
-                                    // small multi-token batches (speculative decoding / MTP verify)
-                                    for (int64_t m_batch : { 2, 4, 8 }) {
-                                        test_cases.emplace_back(new test_mul_mat_vec_fusion(type, glu_op, m_batch, 32, 256,
-                                            use_id, 16, 8, b, with_bias, with_gate, with_lane_scale, {1, 1}));
-                                    }
-                                }
                             }
                         }
                     }
@@ -9997,6 +10376,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    test_cases.emplace_back(new test_mul_mat_vec_fusion(
+        GGML_TYPE_F16, GGML_GLU_OP_SWIGLU, 1, 32, 256,
+        false, 1, 1, false, false, true, false, {1, 1}, 257));
+    test_cases.emplace_back(new test_mul_mat_vec_fusion(
+        GGML_TYPE_F16, GGML_GLU_OP_SWIGLU, 1, 32, 256,
+        true, 16, 8, false, false, true, false, {1, 1}, 257));
+    test_cases.emplace_back(new test_mul_mat_vec_fusion(
+        GGML_TYPE_F16, GGML_GLU_OP_SWIGLU, 1, 32, 256,
+        false, 1, 1, false, false, true, false, {1, 1}, 260, sizeof(float)));
+    test_cases.emplace_back(new test_mul_mat_vec_fusion(
+        GGML_TYPE_F16, GGML_GLU_OP_SWIGLU, 1, 32, 256,
+        true, 16, 8, false, false, true, false, {1, 1}, 260, sizeof(float)));
 
     for (auto gate : {GATING_FUNC_SOFTMAX, GATING_FUNC_SIGMOID, GATING_FUNC_SOFTMAX_WEIGHT, GATING_FUNC_SQRT_SOFTPLUS}) {
         for (bool with_norm : {false, true}) {
@@ -10106,17 +10497,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_glu(GGML_GLU_OP_SWIGLU, type, { 2*17408, n_tokens, 1, 1 }, 0, false));
             test_cases.emplace_back(new test_glu_split(GGML_GLU_OP_SWIGLU, type, { 17408, n_tokens, 1, 1 }, 0));
         }
-    }
-
-    // CONT of a 0<->2 permute at DeepSeek-V4 lightning-indexer shapes:
-    // indexer_kq is [n_kv, n_tokens, n_head=64] and gets ggml_cont(ggml_permute(.., 2,1,0,3)).
-    for (int64_t n_kv : { 1024, 1280, 2048, 2304 }) {
-        test_cases.emplace_back(new test_cont(
-            GGML_TYPE_F32, {n_kv, 64, 64, 1}, false, {2, 1, 0, 3}));
-    }
-    for (int64_t n_kv : { 2048, 2304 }) {
-        test_cases.emplace_back(new test_cont(
-            GGML_TYPE_F32, {n_kv, 512, 64, 1}, false, {2, 1, 0, 3}));
     }
 
     // Conv2d: K=CRS=NPQ=4096 matmul performance
@@ -10584,6 +10964,7 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
 
         std::atomic<size_t> n_ok = 0;
         std::atomic<size_t> tests_run = 0;
+        std::atomic<size_t> selected_cases = 0;
         std::vector<std::string> failed_tests;
         std::mutex failed_tests_mutex;
 
@@ -10607,8 +10988,13 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
             while (my_begin < test_cases.size()) {
                 for (size_t i = my_begin; i < my_end; ++i) {
                     auto & test = test_cases[i];
+                    set_test_case_seed(g_test_seed, test->vars());
                     test_status_t status = test->eval(b, b_cpu, op_names_filter, output_printer);
-                    if (status == test_status_t::SKIPPED || status == test_status_t::NOT_SUPPORTED) {
+                    if (status == test_status_t::SKIPPED) {
+                        continue;
+                    }
+                    selected_cases++;
+                    if (status == test_status_t::NOT_SUPPORTED) {
                         continue;
                     }
                     tests_run++;
@@ -10664,6 +11050,10 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
 
         output_printer->print_summary(test_summary_info(n_ok, tests_run, false));
         output_printer->print_failed_tests(failed_tests);
+        printf("selected_cases=%zu\n", selected_cases.load());
+        if (selected_cases == 0) {
+            return false;
+        }
 
         return n_ok == tests_run;
     }
@@ -10677,7 +11067,9 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
         );
 
         size_t n_ok = 0;
-        for (auto & test : test_cases) {
+        for (size_t i = 0; i < test_cases.size(); ++i) {
+            auto & test = test_cases[i];
+            set_test_case_seed(g_test_seed, test->vars());
             if (test->eval_grad(backend, op_names_filter, output_printer)) {
                 n_ok++;
             }
@@ -10688,7 +11080,9 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
     }
 
     if (mode == MODE_PERF) {
-        for (auto & test : test_cases) {
+        for (size_t i = 0; i < test_cases.size(); ++i) {
+            auto & test = test_cases[i];
+            set_test_case_seed(g_test_seed, test->vars());
             test->eval_perf(backend, op_names_filter, output_printer);
         }
         return true;
@@ -10703,7 +11097,9 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
             test_cases.end()
         );
 
-        for (auto & test : test_cases) {
+        for (size_t i = 0; i < test_cases.size(); ++i) {
+            auto & test = test_cases[i];
+            set_test_case_seed(g_test_seed, test->vars());
             test->eval_support(backend, op_names_filter, output_printer);
         }
         return true;
@@ -10813,7 +11209,7 @@ static void show_test_coverage() {
 
 static void usage(char ** argv) {
     printf("Usage: %s [mode] [-o <op,..>] [-b <backend>] [-p <params regex>] [--output <console|sql|csv>] [--list-ops]", argv[0]);
-    printf(" [--show-coverage] [--test-file <path>] [-j <n>]\n");
+    printf(" [--show-coverage] [--test-file <path>] [-j <n>] [--seed <uint64>]\n");
     printf("    valid modes:\n");
     printf("      - test (default, compare with CPU backend for correctness)\n");
     printf("      - grad (compare gradients from backpropagation with method of finite differences)\n");
@@ -10826,6 +11222,7 @@ static void usage(char ** argv) {
     printf("    --show-coverage shows test coverage\n");
     printf("    --test-file reads test operators from a test file generated by test-export-graph-ops\n");
     printf("    -j <n> runs tests using <n> parallel worker threads (default: 1, test mode only)\n");
+    printf("    --seed <uint64> selects reproducible generated inputs (accepts decimal or 0x-prefixed values)\n");
 }
 
 int main(int argc, char ** argv) {
@@ -10901,11 +11298,27 @@ int main(int argc, char ** argv) {
                 usage(argv);
                 return 1;
             }
+        } else if (strcmp(argv[i], "--seed") == 0) {
+            if (i + 1 < argc) {
+                char * end = nullptr;
+                errno = 0;
+                const unsigned long long parsed = strtoull(argv[++i], &end, 0);
+                if (errno != 0 || end == argv[i] || *end != '\0') {
+                    usage(argv);
+                    return 1;
+                }
+                g_test_seed = static_cast<uint64_t>(parsed);
+            } else {
+                usage(argv);
+                return 1;
+            }
         } else {
             usage(argv);
             return 1;
         }
     }
+
+    printf("backend_ops_seed=%" PRIu64 "\n", g_test_seed);
 
     // load and enumerate backends
     ggml_backend_load_all();
