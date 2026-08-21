@@ -1048,21 +1048,6 @@ class ModelsStore {
 		};
 	}
 
-	/** Map the router modalities, the only source available while a model is not loaded. */
-	private buildArchitectureModalities(
-		architecture: ApiModelDataEntry['architecture']
-	): ModelModalities | undefined {
-		if (!architecture) return undefined;
-
-		const inputs = architecture.input_modalities;
-
-		return {
-			vision: inputs.includes(FileTypeCategory.IMAGE),
-			audio: inputs.includes(FileTypeCategory.AUDIO),
-			video: inputs.includes(FileTypeCategory.VIDEO)
-		};
-	}
-
 	clear(): void {
 		this.unsubscribeStatus();
 		this.statusWaiters.forEach((waiter) => waiter.reject(new Error('Models store cleared')));

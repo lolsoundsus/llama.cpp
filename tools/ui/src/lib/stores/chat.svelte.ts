@@ -1315,16 +1315,6 @@ class ChatStore {
 		// never a stale or empty model resolved later
 		this.setChatStreaming(convId, streamedContent, currentMessageId, effectiveModel);
 
-		// Tracks the last message created in this flow. Used as the parent for the next
-		// turn's assistant message so createAssistantMessage does not have to read
-		// conversationsStore.activeMessages, which may belong to a different conversation
-		// after the user navigates while the loop is still running.
-		let lastCreatedInFlow = currentMessageId;
-
-		// freeze the POST identity from t0 so a stop cancels with the exact session key,
-		// never a stale or empty model resolved later
-		this.setChatStreaming(convId, streamedContent, currentMessageId, effectiveModel);
-
 		const recordModel = (modelName: string | null | undefined, persistImmediately = true): void => {
 			if (!modelName) return;
 

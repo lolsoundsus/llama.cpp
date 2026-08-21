@@ -4141,11 +4141,6 @@ struct test_ssm_scan : public test_case {
         return (head_dim > 1) ? 2e-7 : 1e-7;
     }
 
-    double max_nmse_err() override {
-        // SSD path (head_dim > 1) uses FP16 intermediates (M matrix, X_dt); Mamba-1 is pure FP32.
-        return (head_dim > 1) ? 2e-7 : 1e-7;
-    }
-
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * s   = ggml_new_tensor_4d(ctx, type, d_state,  head_dim,     n_head,       n_seqs);
         ggml_tensor * dt  = ggml_new_tensor_3d(ctx, type, n_head,   n_seq_tokens, n_seqs);
