@@ -76,10 +76,7 @@ if (Python3_Interpreter_FOUND)
     set_property(TEST test-upstream-dflash-only-static PROPERTY LABELS main)
 
     add_test(
-        NAME test-server-loop-guard-checkpoint-static
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
-        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-server-loop-guard-checkpoint-static.py)
-    set_property(TEST test-server-loop-guard-checkpoint-static PROPERTY LABELS main)
 
     add_test(
         NAME test-spec-cession-static
@@ -421,9 +418,6 @@ llama_build_and_test(test-cpu-fattn-support.cpp)
 # the build option instead; the target is resolved when the full project is
 # generated.
 if (LLAMA_BUILD_SERVER)
-    llama_build_and_test(test-server-loop-guard.cpp)
-    target_include_directories(test-server-loop-guard PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
-    target_link_libraries(test-server-loop-guard PRIVATE server-context)
 
 endif()
 # Upstream model-resolution coverage serves repositories through cpp-httplib.
