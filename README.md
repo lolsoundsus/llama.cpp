@@ -1,4 +1,4 @@
-# Unsloth's llama.cpp + Anbeeld's beellama.cpp
+# Vibe-coded Unsloth's llama.cpp + Anbeeld's beellama.cpp (experimental of course)
 Fully edited by Big Pickle in OpenCode.
 LLM inference in C/C++ with Variance-Normalized KV-Cache Quantization.
 
