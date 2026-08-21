@@ -661,13 +661,6 @@ class ModelsStore {
 			return;
 		}
 
-		// Try loading a favorite model
-		const favorite = this.favoriteModelIds.values().next()?.value;
-		if (favorite) {
-			await this.selectModelById(favorite);
-			return;
-		}
-
 		// Fall back to the first available model
 		await this.selectModelById(availableModels[0].id);
 	}
