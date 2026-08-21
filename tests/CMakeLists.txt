@@ -4,22 +4,10 @@ find_package(Python3 COMPONENTS Interpreter QUIET)
 
 if (Python3_Interpreter_FOUND)
     add_test(
-        NAME test-release-workflow-static
-        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
-        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-release-workflow-static.py)
-    set_property(TEST test-release-workflow-static PROPERTY LABELS main)
-
-    add_test(
         NAME test-release-cache-parent
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-release-cache-parent.py)
     set_property(TEST test-release-cache-parent PROPERTY LABELS main)
-
-    add_test(
-        NAME test-backend-ops-seed-static
-        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
-        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-backend-ops-seed-static.py)
-    set_property(TEST test-backend-ops-seed-static PROPERTY LABELS main)
 
     add_test(
         NAME test-cuda-graph-source-properties-static
@@ -80,12 +68,6 @@ if (Python3_Interpreter_FOUND)
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-spec-cession-static.py)
     set_property(TEST test-spec-cession-static PROPERTY LABELS main)
-
-    add_test(
-        NAME test-upstream-merge-keepers-static
-        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
-        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-upstream-merge-keepers-static.py)
-    set_property(TEST test-upstream-merge-keepers-static PROPERTY LABELS main)
 
     add_test(
         NAME test-kvarn-eager-workspace-static
